@@ -1,5 +1,9 @@
 import chainlit as cl
 from research_agent import ResearchAgent
+import os
+import io
+import wave
+import traceback
 
 # Initialize our Maestro agent
 agent = ResearchAgent()
@@ -54,8 +58,9 @@ async def start():
     agent.state.reset_plan()
     
     welcome_message = (
-        "Welcome to the **Eightfold AI Research Agent**! 🚀\n\n"
-        "I can help you build comprehensive Account Plans. Just give me the name of a company you want to research (e.g., 'Apple', 'Stripe', or 'Eightfold'), or ask me a question."
+        "**System Initialized: Enterprise Research Agent** 🟢\n\n"
+        "I am ready to synthesize your next Account Plan. To get the highest quality output, please provide the target company and your specific strategic goal.\n\n"
+        "*Example: 'Research Stripe. We are pitching our new enterprise fraud detection API.'*"
     )
     await cl.Message(content=welcome_message).send()
 
@@ -63,6 +68,29 @@ async def start():
 async def main(message: cl.Message):
     """Executes every time the user sends a message."""
     user_input = message.content
+
+    # --- NEW: DOWNLOAD INTERCEPTOR ---
+    if "download" in user_input.lower() or "export" in user_input.lower():
+        current_plan = agent.state.get_current_plan()
+        if current_plan.get("company_name") == "Not Yet Provided":
+            await cl.Message(content="There is no active plan to download yet!").send()
+            return
+
+        # 1. Generate the Markdown string
+        plan_md = format_plan_to_markdown(current_plan)
+        
+        # 2. Save it to a temporary local file
+        file_name = f"{current_plan['company_name'].replace(' ', '_')}_Account_Plan.md"
+        with open(file_name, "w", encoding="utf-8") as f:
+            f.write(plan_md)
+            
+        # 3. Serve the file to the user in the Chainlit UI
+        elements = [cl.File(name=file_name, path=file_name, display="inline")]
+        await cl.Message(content="Here is your Account Plan ready for download! 📄", elements=elements).send()
+        
+        # Clean up the local file so we don't clutter the server
+        os.remove(file_name)
+        return
 
     # Create a UI Step to show the Agent's "Thought Process" visually
     async with cl.Step(name="Agent Reasoning") as step:
@@ -86,3 +114,101 @@ async def main(message: cl.Message):
 
     # Send the final formatted response back to the UI
     await cl.Message(content=final_output).send()
+
+import io
+import wave
+import traceback # Added for deep error hunting
+
+@cl.on_audio_start
+async def on_audio_start():
+    print("\n--- [AUDIO EVENT] Microphone Started! ---")
+    cl.user_session.set("audio_buffer", [])
+    return True 
+
+@cl.on_audio_chunk
+async def on_audio_chunk(chunk):
+    buffer = cl.user_session.get("audio_buffer")
+    
+    # Failsafe: If start wasn't triggered properly
+    if buffer is None:
+        buffer = []
+        cl.user_session.set("audio_buffer", buffer)
+        
+    # Safely extract bytes regardless of the Chainlit version's internal data structures
+    if isinstance(chunk, dict):
+        buffer.append(chunk.get("data", b""))
+    elif hasattr(chunk, "data"):
+        buffer.append(chunk.data)
+    else:
+        buffer.append(chunk)
+
+# The *args and **kwargs make this immune to signature crashes
+@cl.on_audio_end
+async def on_audio_end(*args, **kwargs): 
+    print("--- [AUDIO EVENT] Microphone Stopped! ---")
+    chunks = cl.user_session.get("audio_buffer")
+    
+    if not chunks:
+        print("[!] ERROR: Audio buffer is completely empty.")
+        await cl.Message(content="⚠️ No audio was captured. Please check your microphone permissions.").send()
+        return
+        
+    print(f"[AUDIO EVENT] Stitching {len(chunks)} audio chunks together...")
+    
+    try:
+        async with cl.Step(name="Transcribing Audio...") as step:
+            # 1. Convert chunks to WAV
+            wav_io = io.BytesIO()
+            with wave.open(wav_io, "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(24000)
+                wav_file.writeframes(b"".join(chunks))
+                
+            wav_io.seek(0)
+            audio_bytes = wav_io.read()
+            
+            print(f"[AUDIO EVENT] Sending {len(audio_bytes)} bytes to Groq Whisper...")
+            
+            # 2. Transcribe with Groq
+            transcription = agent.llm.client.audio.transcriptions.create(
+                file=("voice_memo.wav", audio_bytes),
+                model="whisper-large-v3",
+                response_format="text"
+            )
+            
+            user_input = transcription.strip()
+            print(f"[AUDIO EVENT] Groq Transcribed: '{user_input}'")
+            
+            if not user_input:
+                step.output = "Failed to hear anything."
+                await cl.Message(content="⚠️ I couldn't hear any words. Please try speaking closer to the mic.").send()
+                return
+
+            step.output = f'"{user_input}"'
+            await cl.Message(content=f"🎤 *Heard:* {user_input}").send()
+
+        # 3. Check for manual commands
+        if "download" in user_input.lower() or "export" in user_input.lower():
+            await cl.Message(content="To download, please type the command instead of speaking it.").send()
+            return
+
+        # 4. Pass the text to Maestro
+        async with cl.Step(name="Agent Reasoning") as step:
+            bot_response = agent.process_user_input(user_input)
+            step.output = "Analysis complete."
+
+        # 5. Output rendering
+        current_plan = agent.state.get_current_plan()
+        final_output = f"{bot_response}\n\n"
+        
+        if "general question" not in bot_response.lower() and "Account Plan Research Agent" not in bot_response:
+            final_output += format_plan_to_markdown(current_plan)
+
+        await cl.Message(content=final_output).send()
+
+    except Exception as e:
+        # If ANYTHING fails, it will print the exact line of code that caused the crash in the terminal
+        print(f"\n[!!!] CRITICAL AUDIO ERROR: {e}")
+        traceback.print_exc() 
+        await cl.Message(content=f"⚠️ A system error occurred while processing the audio: {str(e)}").send()

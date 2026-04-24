@@ -1,14 +1,14 @@
-# Welcome to Chainlit! 🚀🤖
+# ⚡ Eightfold AI: Strategic Account Planner
 
-Hi there, Developer! 👋 We're excited to have you on board. Chainlit is a powerful tool designed to help you prototype, debug and share applications built on top of LLMs.
+Welcome to the **Enterprise Research Agent**. This architecture is designed to move beyond basic data-entry and actively synthesize strategic account plans for enterprise sales teams.
 
-## Useful Links 🔗
+### 🧠 Core Capabilities
+* **Semantic Routing:** Intelligently classifies your intent to maintain context.
+* **Agentic Synthesis:** Connects recent news signals to your specific sales goals to generate dynamic Pain Points.
+* **Plausibility Guardrails:** Validates data and resolves conflicting information in real-time.
+* **Voice-to-Text:** Native support for Whisper-v3 voice transcriptions.
 
-- **Documentation:** Get started with our comprehensive [Chainlit Documentation](https://docs.chainlit.io) 📚
-- **Discord Community:** Join our friendly [Chainlit Discord](https://discord.gg/k73SQ3FyUh) to ask questions, share your projects, and connect with other developers! 💬
+### 🚀 Quick Start
+To generate a highly-targeted plan, provide both a **Company** and a **Goal**. 
 
-We can't wait to see what you create with Chainlit! Happy coding! 💻😊
-
-## Welcome screen
-
-To modify the welcome screen, edit the `chainlit.md` file at the root of your project. If you do not want a welcome screen, just leave this file empty.
+*Example: "I need an account plan for Netflix. I want to sell them our AI video compression software."*

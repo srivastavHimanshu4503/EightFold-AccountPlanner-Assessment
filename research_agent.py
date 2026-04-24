@@ -23,12 +23,14 @@ class AccountPlanState:
         # Initialized with default values to ensure type safety.
         self.plan: Dict[str, Any] = {
             "company_name": "Not Yet Provided",
-            "industry": "Unknown",
-            "headquarters": "Unknown",
-            "revenue_or_size": "Unknown",
+            "user_goal": "Not Yet Provided", # e.g., "Sell cloud security"
+            "company_overview": "Unknown",
+            "financial_snapshot": "Unknown",
             "key_executives": [],
-            "recent_news_and_initiatives": [],
-            "competitors": [],
+            "strategic_priorities": [], # Extracted from news
+            "pain_points": [], # Synthesized based on the user's goal
+            "value_proposition": "Unknown", # How the user's product helps them
+            "action_plan": [] # Suggested next steps
         }
         
         # Agentic State Tracking: 
@@ -38,14 +40,16 @@ class AccountPlanState:
     
     def reset_plan(self):
         """Wipes the memory clean to start a new account plan."""
-        self.plan = {
+        self.plan: Dict[str, Any] = {
             "company_name": "Not Yet Provided",
-            "industry": "Unknown",
-            "headquarters": "Unknown",
-            "revenue_or_size": "Unknown",
+            "user_goal": "Not Yet Provided", # e.g., "Sell cloud security"
+            "company_overview": "Unknown",
+            "financial_snapshot": "Unknown",
             "key_executives": [],
-            "recent_news_and_initiatives": [],
-            "competitors": [],
+            "strategic_priorities": [], # Extracted from news
+            "pain_points": [], # Synthesized based on the user's goal
+            "value_proposition": "Unknown", # How the user's product helps them
+            "action_plan": [] # Suggested next steps
         }
         self.open_questions = []
 
@@ -80,62 +84,101 @@ class ResearchTool:
     def __init__(self, max_results: int = 5):
         # We limit results to keep the LLM context window small and focused
         self.max_results = max_results
+        self.api_key = os.getenv("SERP_API_KEY")
 
     def search_web(self, query: str) -> List[Dict[str, str]]:
         """
-        Executes a web search and returns a list of result dictionaries.
+        Executes a web search (Standard + News). Tries SerpAPI first. 
+        Falls back to DuckDuckGo gracefully if rate-limited or unavailable.
         """
         print(f"\n[Agent is searching the web for: '{query}'...]")
         results = []
-        
+
+        # Phase 1: Try SerpAPI
         try:
-            # Note: You'll need to install the 'google-search-results' package
-            search = GoogleSearch({"q": query, "api_key": "YOUR_SERPAPI_KEY"})
-            results = search.get_dict()
+            if not self.api_key:
+                raise Exception("No SerpAPI key provided.")
             
-            if "error" in results:
-                raise Exception("SerpAPI Quota Exceeded")
-                
-            # Parse SerpAPI results...
-            parsed_results = [] # Add your parsing logic here
-            return parsed_results
+            # Standard Search
+            standard_search = GoogleSearch({"q": query, "api_key": self.api_key}).get_dict()
+            if "error" in standard_search:
+                raise Exception(f"SerpAPI Error: {standard_search['error']}")
 
-        # Phase 2: The Graceful Fallback
-        except Exception as e:
-            print(f"[!] Primary search API unavailable ({e}). Falling back to DuckDuckGo...")
-            # Context manager ensures the connection closes properly
-            with DDGS() as ddgs:
-                # Fetch text-based search results
-                raw_results = ddgs.text(query, max_results=self.max_results)
-                
-                for r in raw_results:
+            # News Search
+            news_search = GoogleSearch({"q": query, "tbm": "nws", "api_key": self.api_key}).get_dict()
+
+            # Parse Google Featured Answers (Highest Quality)
+            if "related_questions" in standard_search:
+                for q in standard_search["related_questions"][:2]:
                     results.append({
-                        "title": r.get("title", "No Title"),
-                        "link": r.get("href", "No Link"),
-                        "snippet": r.get("body", "No content available.")
+                        "category": "COMPANY OVERVIEW (Verified)",
+                        "title": q.get("question", "FAQ"),
+                        "snippet": q.get("snippet", "")
                     })
-            
-            print(f"[Search complete. Gathered {len(results)} sources.]")
+
+            # Parse Standard Organic Results
+            if "organic_results" in standard_search:
+                for r in standard_search["organic_results"][:self.max_results]:
+                    results.append({
+                        "category": "COMPANY OVERVIEW",
+                        "title": r.get("title", ""),
+                        "snippet": r.get("snippet", "")
+                    })
+
+            # Parse News Results
+            if "news_results" in news_search:
+                for n in news_search["news_results"][:self.max_results]:
+                    results.append({
+                        "category": "RECENT NEWS & SIGNALS",
+                        "title": n.get("title", ""),
+                        "snippet": n.get("snippet", "")
+                    })
+                    
+            print(f"[Search complete. Gathered {len(results)} sources via SerpAPI.]")
             return results
-            
+
+        # Phase 2: The Graceful Fallback (DuckDuckGo)
         except Exception as e:
-            # Prevents the entire program from crashing if the network drops
-            print(f"[!] Error during web search: {e}")
-            return [{"error": str(e)}]
+            print(f"[!] Primary API unavailable ({e}). Falling back to DuckDuckGo...")
+            
+            try:
+                with DDGS() as ddgs:
+                    # 1. Get standard text results
+                    raw_text = ddgs.text(query, max_results=self.max_results)
+                    for r in raw_text:
+                        results.append({
+                            "category": "COMPANY OVERVIEW",
+                            "title": r.get("title", "No Title"),
+                            "snippet": r.get("body", "No content")
+                        })
+                    
+                    # 2. Get news results using DDGS native news search!
+                    raw_news = ddgs.news(query, max_results=self.max_results)
+                    for r in raw_news:
+                        results.append({
+                            "category": "RECENT NEWS & SIGNALS",
+                            "title": r.get("title", "No Title"),
+                            "snippet": r.get("body", "No content")
+                        })
+                
+                print(f"[Search complete. Gathered {len(results)} sources via DDGS.]")
+                return results
 
-    def format_for_llm(self, results: List[Dict[str, str]]) -> str:
-        """
-        Takes the raw dictionary results and formats them into a clean string
-        so the LLM can easily read and parse the information.
-        """
-        if not results or "error" in results[0]:
-            return "No search results available."
+            except Exception as ddgs_error:
+                print(f"[!] Critical Error: Both Search APIs failed. {ddgs_error}")
+                return [{"category": "ERROR", "title": "Search Failed", "snippet": str(ddgs_error)}]
 
-        formatted_text = "--- SEARCH RESULTS ---\n"
-        for i, res in enumerate(results, 1):
-            formatted_text += f"Source {i} ({res.get('title')}): {res.get('snippet')}\n"
-        formatted_text += "----------------------\n"
-        
+    def format_for_llm(self, search_results: List[Dict[str, str]]) -> str:
+        """
+        Takes the unified dictionary list and formats it into a clean string 
+        so Llama-3 can read the categories (Overview vs News).
+        """
+        formatted_text = ""
+        for res in search_results:
+            formatted_text += f"--- {res.get('category', 'INFO')} ---\n"
+            formatted_text += f"Title: {res.get('title', 'Unknown')}\n"
+            formatted_text += f"Snippet: {res.get('snippet', 'No data')}\n\n"
+            
         return formatted_text
 
 class LLMEngine:
@@ -153,25 +196,36 @@ class LLMEngine:
         # We use Llama 3 70B because it has excellent reasoning and instruction following
         self.model = "llama-3.3-70b-versatile"
     
-    def classify_intent(self, user_input: str, current_company: str) -> str:
+    def classify_intent(self, user_input: str, current_company: str) -> dict:
         """
-        Acts as a semantic router. Classifies the user's input into one of three categories.
+        Acts as a semantic router. Classifies the user's input and extracts context.
         """
+        
         router_prompt = f"""
         You are an intent classification router for an AI assistant.
         The user is currently researching the company: "{current_company}".
         
         USER INPUT: "{user_input}"
         
-        Classify the intent into EXACTLY one of these three categories:
-        1. "NEW_COMPANY": The user is asking to research a completely different company.
-        2. "GENERAL_QUESTION": The user is asking a general definition, coding, or conversational question unrelated to the current company.
-        3. "CURRENT_COMPANY": The user is asking a follow-up question about the current company, or using pronouns like "they/their" implying the current company.
-        4. "CONFUSED_USER": The user appears uncertain, asks for help without a clear direction, provides irrelevant or incoherent responses, or explicitly requests guidance on what to do. The user may also ask for suggestions (e.g., which company to research) or show signs of confusion about the task. In such cases, the assistant should interpret the intent as needing clarification, guidance, or structured suggestions.
+        Classify the intent into EXACTLY one of these four categories:
+        1. "NEW_COMPANY": The user wants to abandon the current company and start a completely new account plan.
+        2. "GENERAL_QUESTION": The user is asking a general definition or off-topic question.
+        3. "CURRENT_COMPANY": The user is asking a follow-up about the active company.
+        4. "CONFUSED_USER": The user is asking for help or doesn't know what to do.
         
-        Output ONLY a JSON object with a single key "intent" and the string value of the category.
+        *** CRITICAL COMPARISON RULE ***
+        If the user mentions a new company in order to COMPARE it to the current company (e.g., "How do they compare to Apple?", "What is their revenue vs Google?"), the intent is STILL "CURRENT_COMPANY". Do NOT trigger "NEW_COMPANY" unless the user explicitly wants to stop researching {current_company}.
+        
+        If the intent is "NEW_COMPANY", you must also extract the target 'company_name' AND the user's underlying 'goal' (why they are researching them, e.g., 'selling cloud security', 'preparing for an interview'). If they don't state a goal, set 'goal' to "General Research".
+        
+        Output ONLY a JSON object with this exact structure:
+        {{
+            "intent": "THE_CATEGORY",
+            "company_name": "Extracted Name or None",
+            "goal": "Extracted Goal or General Research"
+        }}
         """
-        
+
         try:
             response = self.client.chat.completions.create(
                 messages=[{"role": "user", "content": router_prompt}],
@@ -180,33 +234,37 @@ class LLMEngine:
                 response_format={"type": "json_object"}
             )
             parsed = json.loads(response.choices[0].message.content)
-            return parsed.get("intent", "CURRENT_COMPANY")
-        except Exception:
-            # Fallback to current company if the API hiccups
-            return "CURRENT_COMPANY"
+            return parsed # We now return the whole dictionary, not just the string!
+            
+        except Exception as e:
+            print(f"[!] Router Error: {e}")
+            # Fallback dictionary if the API hiccups
+            return {"intent": "CURRENT_COMPANY", "company_name": None, "goal": "General Research"}
 
     def extract_info(self, raw_text: str, current_state: Dict[str, Any]) -> Dict[str, Any]:
         """
         Sends the raw text to Llama 3 and forces it to return ONLY a JSON object
-        updating our Account Plan structure.
+        updating our Account Plan structure, synthesizing strategic sales insights.
         """
-        print("[Agent is analyzing the data...]")
+        print("[Agent is synthesizing strategic data...]")
         
-        # The System Prompt: This dictates the Agentic Behaviour
+        # The Upgraded Sales Strategist Prompt
         system_prompt = f"""
-        You are an expert corporate research assistant. Your job is to extract 
-        information from the provided SEARCH RESULTS and update the CURRENT STATE 
-        of the Account Plan.
+        You are an elite Enterprise Sales Strategist. Your job is to update the Account Plan based on the SEARCH RESULTS and the USER GOAL.
 
-        CURRENT STATE:
+        CURRENT ACCOUNT PLAN STATE:
         {json.dumps(current_state, indent=2)}
 
+        USER GOAL (Why the user is researching this company): {current_state.get('user_goal', 'General Research')}
+
         RULES:
-        1. You must output ONLY a valid JSON object. Do not wrap it in markdown block quotes. No explanations.
-        2. Keep the exact same keys as the CURRENT STATE. Update the values if you find new information.
-        3. AGENTIC BEHAVIOUR: If you find CONFLICTING information for a single key (e.g., two different CEOs or conflicting revenue numbers), do NOT guess. Instead, add a clear question to the "open_questions" list asking the user how to resolve it.
-        4. If you do not find new info for a key, leave it as its current value.
-        5. MISSING CRITICAL DATA: If the 'Company Name' or 'Industry' fields are currently 'Unknown' and you cannot find them in the search results, add a polite question to 'open_questions' asking the user for guidance (e.g., 'I couldn't find the exact industry for this company. Do you happen to know it, or should I leave it blank?'). Do NOT do this for Revenue or Competitors, as those are often private.
+        1. EXTRACT FACTS: Update basic fields (company_overview, financial_snapshot, key_executives, action_plan) using the provided text. Be highly detailed and descriptive.
+        2. SYNTHESIZE STRATEGIC PRIORITIES: Read the 'Recent News & Signals' in the text and deduce what the company is currently focused on (e.g., European expansion, cost-cutting, AI adoption, new product launches). Add these to 'strategic_priorities'.
+        3. SYNTHESIZE PAIN POINTS: Based on their Strategic Priorities and the USER GOAL, deduce 2-3 likely pain points. (e.g., If the goal is selling cybersecurity, and news shows they are expanding to Europe, a pain point is "GDPR compliance latency"). Add these to 'pain_points'.
+        4. CRAFT VALUE PROPOSITION: Write a targeted 2-3 sentence pitch connecting the USER GOAL to the company's pain points and strategic priorities. Place this in 'value_proposition'.
+        5. AGENTIC CONFLICT: If you find conflicting factual information, add a clear question to the "open_questions" list asking the user how to resolve it.
+        6. STRICT DATA TYPES: 'key_executives', 'strategic_priorities', 'pain_points', and 'action_plan' MUST be JSON arrays of strings. DO NOT output a single string with HTML `<br>` tags or bullet points. 
+        7. STRICT OUTPUT: Return ONLY a valid JSON object matching the exact keys in the CURRENT ACCOUNT PLAN STATE. Do not invent new keys. Do not wrap in markdown blocks.
         """
 
         try:
@@ -244,76 +302,77 @@ class ResearchAgent:
         self.llm = LLMEngine() 
 
     def process_user_input(self, user_input: str) -> str:
-        """
-        Takes the user's string, decides the action, and executes the pipeline step-by-step.
-        """
-        # --- BRANCH 1: CONFLICT RESOLUTION ---
-        # If there is an active question in memory, we treat the user input as the answer.
-        if len(self.state.open_questions) > 0:
-            return self.handle_conflict_resolution(user_input)
+        
+        # 1. ALWAYS ROUTE FIRST: Get the context before making any decisions
+        current_company = self.state.plan.get("company_name", "Not Yet Provided")
+        print("[Agent is routing the query...]")
+        
+        router_data = self.llm.classify_intent(user_input, current_company)
+        intent = router_data.get("intent", "CURRENT_COMPANY")
+        extracted_company = router_data.get("company_name")
+        user_goal = router_data.get("goal", "General Research")
 
-        # --- BRANCH 2: NORMAL RESEARCH ---
+        # 2. Handle Manual Commands & Non-Research Intents
         if "show" in user_input.lower() or "plan" in user_input.lower() and len(user_input) < 15:
             return "Here is the current state of the Account Plan."
-
-        # --- THE NEW INTENT ROUTER ---
-        current_company = self.state.plan.get("company_name", "None")
-        print("[Agent is routing the query...]")
-        intent = self.llm.classify_intent(user_input, current_company)
+            
+        if intent == "CONFUSED_USER":
+            return "I am an Account Plan Research Agent! Tell me the name of a company you want to research, and optionally what you are trying to sell them (e.g., 'Research TechNova, I want to sell them cloud security'). Do you have a company in mind?"
 
         if intent == "GENERAL_QUESTION":
             return "That seems like a general question. I am currently focused on researching companies for Account Plans. How can I help you with your company research?"
             
-        elif intent == "NEW_COMPANY":
+        # 3. Handle Context Switches (The Hostage Fix)
+        if intent == "NEW_COMPANY":
             if current_company != "Not Yet Provided":
                 print("[!] Context switch detected. Wiping memory for new company...")
-            # The memory is wiped, so it will now naturally start a new plan!
+            
+            # Wiping the memory ALSO clears self.state.open_questions!
             self.state.reset_plan()
-        
-        elif intent == "CONFUSED_USER":
-            return  "It looks like you might need a starting point. I can research and build a detailed account profile for any company.\nJust share a company name (e.g., 'Apple', 'Stripe', or any other), and I’ll take it from there.\nWhat company would you like me to look into?"
             
-        # 3. Information Retrieval (Slightly modified to ensure good search results)
+            if extracted_company:
+                self.state.update_section("company_name", extracted_company)
+            self.state.update_section("user_goal", user_goal)
+
+        # 4. NOW check Conflict Resolution
+        # (If the user changed companies above, this is now empty, bypassing the trap)
+        if len(self.state.open_questions) > 0:
+            return self.handle_conflict_resolution(user_input)
+            
+        # 5. Information Retrieval Setup
         search_query = user_input
+        
         if intent == "CURRENT_COMPANY" and current_company != "Not Yet Provided":
-            # If the user says "what is their revenue?", we append the company name 
-            # so DuckDuckGo knows exactly who "their" is.
             search_query = f"{current_company} {user_input}"
-            
+        elif intent == "NEW_COMPANY" and extracted_company:
+            search_query = f"{extracted_company} recent news and company strategy"
+
+        # 6. Web Search & Formatting
         raw_data = self.tool.search_web(search_query)
         llm_ready_string = self.tool.format_for_llm(raw_data)
-
-        # 3. State Injection (We temporarily inject open_questions so the LLM can use it)
-        # Fix: Use .copy() so we don't accidentally mutate our core state memory
+        
+        # 7. LLM Extraction
         current_plan_copy = self.state.get_current_plan().copy()
         current_plan_copy["open_questions"] = []
-
-        # 4. LLM Processing
+        
         updated_data = self.llm.extract_info(llm_ready_string, current_plan_copy)
-
+        
         if "error" in updated_data:
             return "I encountered a technical error while analyzing the data."
 
-        # 5. Agentic Evaluation: Check if the LLM flagged any conflicts
-        # Extract the questions safely
+        # 8. Queue Management & State Update
         questions = updated_data.get("open_questions", [])
-        
-        # Clean up the dictionary before saving it to state
         if "open_questions" in updated_data:
             del updated_data["open_questions"]
-
-        # 6. Update the plan in memory
+            
         for key, value in updated_data.items():
             self.state.update_section(key, value)
-
-        # 7. Agentic Routing Evaluation
+            
         if questions:
-            # We save the conflict to our State class to trigger Branch 1 on the next loop
             self.state.open_questions = questions
-            # The bot halts the update and asks the user for direction
             return f"[!] I need clarification before proceeding:\n- {questions[0]}\n(Type your answer, or type 'skip' if you don't know)"
         else:
-            return "I have successfully analyzed the data and updated the Account Plan."
+            return f"I have successfully analyzed the data and updated the Account Plan for {self.state.plan.get('company_name')}."
 
     
     def handle_conflict_resolution(self, user_input: str) -> str:
@@ -369,7 +428,6 @@ class ResearchAgent:
             
         return "Thank you! All conflicts resolved and the plan is updated."
     
-
 class TerminalUI:
     """
     Handles the hacker-style aesthetic and user conversation loop using 'rich'.

@@ -1,6 +1,5 @@
 import chainlit as cl
 from research_agent import ResearchAgent
-import os
 import io
 import wave
 import traceback

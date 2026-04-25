@@ -78,18 +78,22 @@ async def main(message: cl.Message):
 
         # 1. Generate the Markdown string
         plan_md = format_plan_to_markdown(current_plan)
+        company_safe_name = current_plan['company_name'].replace(' ', '_')
+        file_name = f"{company_safe_name}_Account_Plan.md"
         
-        # 2. Save it to a temporary local file
-        file_name = f"{current_plan['company_name'].replace(' ', '_')}_Account_Plan.md"
-        with open(file_name, "w", encoding="utf-8") as f:
-            f.write(plan_md)
-            
-        # 3. Serve the file to the user in the Chainlit UI
-        elements = [cl.File(name=file_name, path=file_name, display="inline")]
+        # 2. Generate the file purely in-memory (no hard drive saving!)
+        # Explicitly setting mime="text/markdown" prevents the frontend crash.
+        elements = [
+            cl.File(
+                name=file_name, 
+                content=plan_md.encode('utf-8'), # Encode string to raw bytes
+                display="inline",
+                mime="text/markdown" 
+            )
+        ]
+        
+        # 3. Serve the file to the user
         await cl.Message(content="Here is your Account Plan ready for download! 📄", elements=elements).send()
-        
-        # Clean up the local file so we don't clutter the server
-        os.remove(file_name)
         return
 
     # Create a UI Step to show the Agent's "Thought Process" visually

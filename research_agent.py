@@ -26,6 +26,8 @@ class AccountPlanState:
             "user_goal": "Not Yet Provided", # e.g., "Sell cloud security"
             "company_overview": "Unknown",
             "financial_snapshot": "Unknown",
+            "market_revenue": "Unknown",     # <-- ADD THIS
+            "competitors": [],               # <-- ADD THIS
             "key_executives": [],
             "strategic_priorities": [], # Extracted from news
             "pain_points": [], # Synthesized based on the user's goal
@@ -258,14 +260,15 @@ class LLMEngine:
         USER GOAL (Why the user is researching this company): {current_state.get('user_goal', 'General Research')}
 
         RULES:
-        1. EXTRACT FACTS: Update basic fields (company_overview, financial_snapshot, key_executives, action_plan) using the provided text. Be highly detailed and descriptive.
+        1. EXTRACT FACTS: Update basic fields (company_overview, financial_snapshot, key_executives, action_plan, competitors) using the provided text. If the search text lacks specific financial details or specific Competitors, use your baseline enterprise knowledge to provide a highly accurate summary. Be highly detailed and descriptive.
         2. EXTRACT MARKET DATA: Identify the company's estimated 'market_revenue' and a list of their top 'competitors'. Add these as new keys.
         3. SYNTHESIZE STRATEGIC PRIORITIES: Read the 'Recent News & Signals' in the text and deduce what the company is currently focused on (e.g., European expansion, cost-cutting, AI adoption, new product launches). Add these to 'strategic_priorities'.
         4. SYNTHESIZE PAIN POINTS: Based on their Strategic Priorities and the USER GOAL, deduce 2-3 likely pain points. (e.g., If the goal is selling cybersecurity, and news shows they are expanding to Europe, a pain point is "GDPR compliance latency"). Add these to 'pain_points'.
         5. CRAFT VALUE PROPOSITION: Write a targeted 2-3 sentence pitch connecting the USER GOAL to the company's pain points and strategic priorities. Place this in 'value_proposition'.
         6. AGENTIC CONFLICT: If you find conflicting factual information, add a clear question to the "open_questions" list asking the user how to resolve it.
         7. STRICT DATA TYPES: 'key_executives', 'strategic_priorities', 'pain_points', and 'action_plan' MUST be JSON arrays of strings. DO NOT output a single string with HTML `<br>` tags or bullet points. 
-        8. STRICT OUTPUT: Return ONLY a valid JSON object matching the exact keys in the CURRENT ACCOUNT PLAN STATE. Do not invent new keys. Do not wrap in markdown blocks.
+        8. EXTRACT MARKET DATA: Identify the company's estimated 'market_revenue' and a list of their top 'competitors'. Add these as new keys. (You may use your baseline industry knowledge to list competitors if they are missing from the text).
+        9. STRICT OUTPUT: Return ONLY a valid JSON object matching the exact keys in the CURRENT ACCOUNT PLAN STATE. Do not invent new keys. Do not wrap in markdown blocks.
         """
 
         try:
@@ -346,7 +349,8 @@ class ResearchAgent:
         if intent == "CURRENT_COMPANY" and current_company != "Not Yet Provided":
             search_query = f"{current_company} {user_input}"
         elif intent == "NEW_COMPANY" and extracted_company:
-            search_query = f"{extracted_company} recent news and company strategy"
+            # UPGRADED: We now explicitly force the search engine to pull market and financial data
+            search_query = f"{extracted_company} company overview, market revenue, top competitors, and recent strategy"
 
         # 6. Web Search & Formatting
         raw_data = self.tool.search_web(search_query)

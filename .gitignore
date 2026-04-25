@@ -1,5 +1,4 @@
 .env
-test.py
 .files/
 .chainlit/
 __pycache__/

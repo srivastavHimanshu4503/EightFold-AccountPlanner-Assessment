@@ -19,8 +19,10 @@ def format_plan_to_markdown(plan_data: dict) -> str:
     sections = [
         ("🏢 Company Overview", "company_overview"),
         ("💰 Financial Snapshot", "financial_snapshot"),
+        ("📈 Market Revenue", "market_revenue"),     # <-- NEW
+        ("⚔️ Top Competitors", "competitors"),       # <-- NEW
         ("👥 Key Executives", "key_executives"),
-        ("📈 Strategic Priorities", "strategic_priorities"),
+        ("🎯 Strategic Priorities", "strategic_priorities"),
         ("⚠️ Pain Points", "pain_points"),
         ("💡 Value Proposition", "value_proposition"),
         ("🚀 Action Plan", "action_plan")
@@ -85,14 +87,15 @@ async def main(message: cl.Message):
         elements = [
             cl.File(
                 name=file_name, 
-                content=plan_md.encode('utf-8'), # Encode string to raw bytes
+                content=plan_md.encode('utf-8'),
                 display="inline",
                 mime="text/markdown" 
             )
         ]
         
-        # 3. Serve the file to the user
-        await cl.Message(content="Here is your Account Plan ready for download! 📄", elements=elements).send()
+        # 3. Serve the text message FIRST, then send the file as a separate message
+        await cl.Message(content="Here is your Account Plan ready for download! 📄").send()
+        await cl.Message(content="", elements=elements).send() # This forces the file to render below the text
         return
 
     # Create a UI Step to show the Agent's "Thought Process" visually
@@ -122,11 +125,6 @@ import io
 import wave
 import traceback # Added for deep error hunting
 
-@cl.on_audio_start
-async def on_audio_start():
-    print("\n--- [AUDIO EVENT] Microphone Started! ---")
-    cl.user_session.set("audio_buffer", [])
-    return True 
 
 @cl.on_audio_chunk
 async def on_audio_chunk(chunk):

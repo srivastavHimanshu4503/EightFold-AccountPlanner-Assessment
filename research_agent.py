@@ -259,12 +259,13 @@ class LLMEngine:
 
         RULES:
         1. EXTRACT FACTS: Update basic fields (company_overview, financial_snapshot, key_executives, action_plan) using the provided text. Be highly detailed and descriptive.
-        2. SYNTHESIZE STRATEGIC PRIORITIES: Read the 'Recent News & Signals' in the text and deduce what the company is currently focused on (e.g., European expansion, cost-cutting, AI adoption, new product launches). Add these to 'strategic_priorities'.
-        3. SYNTHESIZE PAIN POINTS: Based on their Strategic Priorities and the USER GOAL, deduce 2-3 likely pain points. (e.g., If the goal is selling cybersecurity, and news shows they are expanding to Europe, a pain point is "GDPR compliance latency"). Add these to 'pain_points'.
-        4. CRAFT VALUE PROPOSITION: Write a targeted 2-3 sentence pitch connecting the USER GOAL to the company's pain points and strategic priorities. Place this in 'value_proposition'.
-        5. AGENTIC CONFLICT: If you find conflicting factual information, add a clear question to the "open_questions" list asking the user how to resolve it.
-        6. STRICT DATA TYPES: 'key_executives', 'strategic_priorities', 'pain_points', and 'action_plan' MUST be JSON arrays of strings. DO NOT output a single string with HTML `<br>` tags or bullet points. 
-        7. STRICT OUTPUT: Return ONLY a valid JSON object matching the exact keys in the CURRENT ACCOUNT PLAN STATE. Do not invent new keys. Do not wrap in markdown blocks.
+        2. EXTRACT MARKET DATA: Identify the company's estimated 'market_revenue' and a list of their top 'competitors'. Add these as new keys.
+        3. SYNTHESIZE STRATEGIC PRIORITIES: Read the 'Recent News & Signals' in the text and deduce what the company is currently focused on (e.g., European expansion, cost-cutting, AI adoption, new product launches). Add these to 'strategic_priorities'.
+        4. SYNTHESIZE PAIN POINTS: Based on their Strategic Priorities and the USER GOAL, deduce 2-3 likely pain points. (e.g., If the goal is selling cybersecurity, and news shows they are expanding to Europe, a pain point is "GDPR compliance latency"). Add these to 'pain_points'.
+        5. CRAFT VALUE PROPOSITION: Write a targeted 2-3 sentence pitch connecting the USER GOAL to the company's pain points and strategic priorities. Place this in 'value_proposition'.
+        6. AGENTIC CONFLICT: If you find conflicting factual information, add a clear question to the "open_questions" list asking the user how to resolve it.
+        7. STRICT DATA TYPES: 'key_executives', 'strategic_priorities', 'pain_points', and 'action_plan' MUST be JSON arrays of strings. DO NOT output a single string with HTML `<br>` tags or bullet points. 
+        8. STRICT OUTPUT: Return ONLY a valid JSON object matching the exact keys in the CURRENT ACCOUNT PLAN STATE. Do not invent new keys. Do not wrap in markdown blocks.
         """
 
         try:
@@ -370,9 +371,10 @@ class ResearchAgent:
             
         if questions:
             self.state.open_questions = questions
-            return f"[!] I need clarification before proceeding:\n- {questions[0]}\n(Type your answer, or type 'skip' if you don't know)"
+            # Using Markdown blockquotes and bolding to make it look like a distinct UI element
+            return f"### 🛑 Clarification Required\n> **{questions[0]}**\n\n*(Type your answer below, or type 'skip' if you don't know)*"
         else:
-            return f"I have successfully analyzed the data and updated the Account Plan for {self.state.plan.get('company_name')}."
+            return f"### 🟢 I have successfully analyzed the data and updated the Account Plan for {self.state.plan.get('company_name')}."
 
     
     def handle_conflict_resolution(self, user_input: str) -> str:

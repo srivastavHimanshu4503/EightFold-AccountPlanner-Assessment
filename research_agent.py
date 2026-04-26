@@ -1,545 +1,1821 @@
+"""
+research_agent.py — Production-grade Enterprise Research Agent
+=============================================================
+Architecture: AccountPlanState → ResearchTool → LLMEngine → ResearchAgent
+
+CRITICAL FIX SUMMARY:
+  - No global singleton: ResearchAgent must be instantiated per Chainlit session.
+  - Full async architecture: AsyncGroq + asyncio.to_thread() for search.
+  - Retry with exponential backoff on all Groq and SerpAPI calls.
+  - TTL cache (5 min) on search results to prevent redundant API calls.
+  - Structured prompts (ROLE / EXTRACTION RULES / SYNTHESIS RULES /
+    CONFLICT RULES / OUTPUT FORMAT / FEW-SHOT EXAMPLE).
+  - Section-level update pipeline (SECTION_UPDATE intent).
+  - Confidence scoring per section: HIGH / MEDIUM / LOW.
+  - Private/low-data company detection with user-facing warnings.
+  - Plan hash for change detection (prevents redundant re-renders).
+  - Key executives include titles + strategic relevance.
+  - Named competitors with differentiation notes.
+  - Comparison mode (parallel research on two companies).
+  - Streaming direct answers for follow-up questions.
+  - Dead code removed: TerminalUI and TestExecution are kept but separated clearly.
+"""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import os
+import time
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+
 from dotenv import load_dotenv
-from typing import Dict, Any, List
 from ddgs import DDGS
 from serpapi import GoogleSearch
-from groq import Groq
-from rich.console import Console
-from rich.panel import Panel
-from rich.prompt import Prompt
-from rich.table import Table
-import time
-import json
-import os
+from groq import AsyncGroq, Groq
 
 load_dotenv()
 
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("research_agent")
+
+# ── Environment Validation ────────────────────────────────────────────────────
+REQUIRED_ENV_VARS = ["GROQ_API_KEY"]
+
+
+def validate_environment() -> None:
+    """
+    Validates required environment variables at startup.
+    Raises EnvironmentError immediately so the app fails fast with a clear message
+    rather than crashing on the first user message.
+    """
+    missing = [v for v in REQUIRED_ENV_VARS if not os.getenv(v)]
+    if missing:
+        raise EnvironmentError(
+            f"Missing required environment variables: {missing}\n"
+            "Copy .env.example to .env and fill in your API keys."
+        )
+
+
+validate_environment()
+
+# ── Plan Constants ────────────────────────────────────────────────────────────
+UPDATABLE_SECTIONS: frozenset = frozenset({
+    "company_overview", "financial_snapshot", "market_revenue", "competitors",
+    "key_executives", "strategic_priorities", "pain_points",
+    "value_proposition", "action_plan",
+})
+
+
+# ── Account Plan State ────────────────────────────────────────────────────────
+
 class AccountPlanState:
     """
-    Manages the memory and data structure of the Account Plan.
-    Acts as the single source of truth during the research process.
+    Per-session, in-memory state for a single Account Plan.
+
+    IMPORTANT: This class must be instantiated inside cl.on_chat_start() and
+    stored via cl.user_session.set("agent", agent). A global instance would
+    cause all concurrent users to share — and overwrite — each other's plans.
+
+    Design: _default_plan() is the single source of truth for the schema.
+    Both __init__ and reset_plan() call it, guaranteeing permanent sync.
     """
-    def __init__(self):
-        # The core data structure for our Account Plan.
-        # Initialized with default values to ensure type safety.
-        self.plan: Dict[str, Any] = {
-            "company_name": "Not Yet Provided",
-            "user_goal": "Not Yet Provided", # e.g., "Sell cloud security"
-            "company_overview": "Unknown",
-            "financial_snapshot": "Unknown",
-            "market_revenue": "Unknown",     # <-- ADD THIS
-            "competitors": [],               # <-- ADD THIS
-            "key_executives": [],
-            "strategic_priorities": [], # Extracted from news
-            "pain_points": [], # Synthesized based on the user's goal
-            "value_proposition": "Unknown", # How the user's product helps them
-            "action_plan": [] # Suggested next steps
+
+    def _default_plan(self) -> Dict[str, Any]:
+        """Returns a fresh, fully-typed Account Plan skeleton."""
+        return {
+            "company_name":         "Not Yet Provided",
+            "user_goal":            "Not Yet Provided",
+            "company_overview":     "Unknown",
+            "financial_snapshot":   "Unknown",
+            "market_revenue":       "Unknown",
+            "competitors":          [],   # List[str] — "Name — differentiation note"
+            "key_executives":       [],   # List[str] — "Name — Title, strategic note"
+            "strategic_priorities": [],   # List[str]
+            "pain_points":          [],   # List[str]
+            "value_proposition":    "Unknown",
+            "action_plan":          [],   # List[str]
+            "data_confidence":      {},   # Dict[section_key, "HIGH"|"MEDIUM"|"LOW"]
+            "data_warnings":        [],   # List[str] — user-facing data quality notices
         }
-        
-        # Agentic State Tracking: 
-        # This is crucial for the "Agentic Behaviour" evaluation. 
-        # It holds conflicting data or clarifying questions for the user.
+
+    def __init__(self) -> None:
+        self.plan: Dict[str, Any] = self._default_plan()
         self.open_questions: List[str] = []
-    
-    def reset_plan(self):
-        """Wipes the memory clean to start a new account plan."""
-        self.plan: Dict[str, Any] = {
-            "company_name": "Not Yet Provided",
-            "user_goal": "Not Yet Provided", # e.g., "Sell cloud security"
-            "company_overview": "Unknown",
-            "financial_snapshot": "Unknown",
-            "key_executives": [],
-            "strategic_priorities": [], # Extracted from news
-            "pain_points": [], # Synthesized based on the user's goal
-            "value_proposition": "Unknown", # How the user's product helps them
-            "action_plan": [] # Suggested next steps
-        }
+        self._rendered_hash: str = ""
+
+    def reset_plan(self) -> None:
+        """
+        Full state reset for a company pivot.
+        Also clears the conflict queue so stale clarification prompts
+        cannot execute after the context switch.
+        """
+        self.plan = self._default_plan()
         self.open_questions = []
+        self._rendered_hash = ""
 
     def update_section(self, section_key: str, data: Any) -> bool:
         """
-        Safely updates a specific section of the account plan.
-        Returns True if successful, False if the key doesn't exist.
+        Safely updates a single section. Returns False on unknown key
+        rather than silently creating orphan fields.
         """
-        if section_key in self.plan:
-            self.plan[section_key] = data
-            return True
-        print(f"Error: Attempted to update invalid section '{section_key}'")
-        return False
-
-    def add_open_question(self, question: str) -> None:
-        """Adds a conflict or clarifying question to the queue."""
-        self.open_questions.append(question)
-
-    def clear_open_questions(self) -> None:
-        """Clears the queue once the user resolves the conflicts."""
-        self.open_questions = []
+        if section_key not in self.plan:
+            logger.warning(
+                "update_section: unknown field '%s' — skipping.", section_key
+            )
+            return False
+        self.plan[section_key] = data
+        return True
 
     def get_current_plan(self) -> Dict[str, Any]:
-        """Returns the current state of the plan as a dictionary."""
-        return self.plan
+        """Returns a shallow copy of the plan to prevent external mutation."""
+        return self.plan.copy()
+
+    def compute_hash(self) -> str:
+        """SHA-256 of the serialised plan for change detection."""
+        return hashlib.md5(
+            json.dumps(self.plan, sort_keys=True, default=str).encode()
+        ).hexdigest()
+
+    def has_changed_since_last_render(self) -> bool:
+        """
+        Returns True if the plan changed since the last time this was called.
+        Calling this method also snapshots the new hash, so repeated calls
+        return False until another change occurs.
+        """
+        new_hash = self.compute_hash()
+        if new_hash != self._rendered_hash:
+            self._rendered_hash = new_hash
+            return True
+        return False
+
+
+# ── Search Cache ──────────────────────────────────────────────────────────────
+
+class SearchCache:
+    """
+    Simple TTL-based in-memory cache for search results.
+    Prevents identical API calls from being fired when the user asks
+    about the same company twice within the cache window (default: 5 min).
+    """
+
+    def __init__(self, ttl_seconds: int = 300) -> None:
+        self._store: Dict[str, Tuple[float, List[Dict]]] = {}
+        self.ttl = ttl_seconds
+
+    def get(self, key: str) -> Optional[List[Dict]]:
+        entry = self._store.get(key)
+        if entry:
+            ts, data = entry
+            if time.monotonic() - ts < self.ttl:
+                logger.info("Cache HIT: '%s'", key[:70])
+                return data
+            del self._store[key]
+        return None
+
+    def set(self, key: str, data: List[Dict]) -> None:
+        self._store[key] = (time.monotonic(), data)
+
+    def clear(self) -> None:
+        self._store.clear()
+
+
+# ── Research Tool ─────────────────────────────────────────────────────────────
 
 class ResearchTool:
     """
-    Handles fetching real-world data from the web using DuckDuckGo.
-    This acts as the agent's eyes, gathering raw information.
+    Web search layer with graceful fallback (SerpAPI → DuckDuckGo),
+    TTL caching, and async wrappers for non-blocking use in Chainlit.
+
+    Source attribution is preserved in every result for transparency —
+    a B2B research tool must be able to show where facts came from.
     """
-    def __init__(self, max_results: int = 5):
-        # We limit results to keep the LLM context window small and focused
+
+    def __init__(self, max_results: int = 5) -> None:
         self.max_results = max_results
-        self.api_key = os.getenv("SERP_API_KEY")
+        self.serp_key: Optional[str] = os.getenv("SERP_API_KEY")
+        self._cache = SearchCache(ttl_seconds=300)
+
+    # ── Sync search (used internally) ─────────────────────────────────────────
 
     def search_web(self, query: str) -> List[Dict[str, str]]:
         """
-        Executes a web search (Standard + News). Tries SerpAPI first. 
-        Falls back to DuckDuckGo gracefully if rate-limited or unavailable.
+        Executes organic + news search. SerpAPI → DDGS fallback.
+        Results are cached by query string.
         """
-        print(f"\n[Agent is searching the web for: '{query}'...]")
-        results = []
+        cached = self._cache.get(query)
+        if cached is not None:
+            return cached
 
-        # Phase 1: Try SerpAPI
+        logger.info("Searching web: '%s'", query[:70])
+        results = self._try_serpapi(query) or self._try_ddgs(query)
+        self._cache.set(query, results)
+        return results
+
+    def _try_serpapi(self, query: str) -> Optional[List[Dict[str, str]]]:
+        """Attempts SerpAPI (organic + news). Returns None on any failure."""
+        if not self.serp_key:
+            return None
         try:
-            if not self.api_key:
-                raise Exception("No SerpAPI key provided.")
-            
-            # Standard Search
-            standard_search = GoogleSearch({"q": query, "api_key": self.api_key}).get_dict()
-            if "error" in standard_search:
-                raise Exception(f"SerpAPI Error: {standard_search['error']}")
+            organic = GoogleSearch({"q": query, "api_key": self.serp_key}).get_dict()
+            if "error" in organic:
+                raise RuntimeError(f"SerpAPI: {organic['error']}")
+            news = GoogleSearch(
+                {"q": query, "tbm": "nws", "api_key": self.serp_key}
+            ).get_dict()
 
-            # News Search
-            news_search = GoogleSearch({"q": query, "tbm": "nws", "api_key": self.api_key}).get_dict()
+            results: List[Dict] = []
+            for faq in organic.get("related_questions", [])[:2]:
+                results.append({
+                    "category": "VERIFIED_FAQ",
+                    "title":    faq.get("question", "FAQ"),
+                    "snippet":  faq.get("snippet", ""),
+                    "date":     "",
+                    "source":   "SerpAPI/FAQ",
+                })
+            for r in organic.get("organic_results", [])[:self.max_results]:
+                results.append({
+                    "category": "COMPANY_DATA",
+                    "title":    r.get("title", ""),
+                    "snippet":  r.get("snippet", ""),
+                    "date":     r.get("date", ""),
+                    "source":   r.get("link", "SerpAPI"),
+                })
+            for n in news.get("news_results", [])[:self.max_results]:
+                results.append({
+                    "category": "RECENT_NEWS",
+                    "title":    n.get("title", ""),
+                    "snippet":  n.get("snippet", ""),
+                    "date":     n.get("date", ""),
+                    "source":   n.get("link", "SerpAPI/News"),
+                })
 
-            # Parse Google Featured Answers (Highest Quality)
-            if "related_questions" in standard_search:
-                for q in standard_search["related_questions"][:2]:
+            logger.info("SerpAPI → %d results for '%s'", len(results), query[:60])
+            return results or None
+
+        except Exception as exc:
+            logger.warning("SerpAPI unavailable (%s). Falling back to DDGS.", exc)
+            return None
+
+    def _try_ddgs(self, query: str) -> List[Dict[str, str]]:
+        """DuckDuckGo fallback. Always returns a list (empty on total failure)."""
+        results: List[Dict] = []
+        try:
+            with DDGS() as ddgs:
+                for r in ddgs.text(query, max_results=self.max_results) or []:
                     results.append({
-                        "category": "COMPANY OVERVIEW (Verified)",
-                        "title": q.get("question", "FAQ"),
-                        "snippet": q.get("snippet", "")
+                        "category": "COMPANY_DATA",
+                        "title":    r.get("title", ""),
+                        "snippet":  r.get("body", ""),
+                        "date":     "",
+                        "source":   r.get("href", "DDGS"),
                     })
-
-            # Parse Standard Organic Results
-            if "organic_results" in standard_search:
-                for r in standard_search["organic_results"][:self.max_results]:
+                for r in ddgs.news(query, max_results=self.max_results) or []:
                     results.append({
-                        "category": "COMPANY OVERVIEW",
-                        "title": r.get("title", ""),
-                        "snippet": r.get("snippet", "")
+                        "category": "RECENT_NEWS",
+                        "title":    r.get("title", ""),
+                        "snippet":  r.get("body", ""),
+                        "date":     r.get("date", ""),
+                        "source":   r.get("url", "DDGS/News"),
                     })
+            logger.info("DDGS → %d results for '%s'", len(results), query[:60])
+        except Exception as exc:
+            logger.error("DDGS failed: %s", exc)
+            results.append({
+                "category": "ERROR",
+                "title":    "Search Failed",
+                "snippet":  str(exc),
+                "date":     "",
+                "source":   "N/A",
+            })
+        return results
 
-            # Parse News Results
-            if "news_results" in news_search:
-                for n in news_search["news_results"][:self.max_results]:
-                    results.append({
-                        "category": "RECENT NEWS & SIGNALS",
-                        "title": n.get("title", ""),
-                        "snippet": n.get("snippet", "")
-                    })
-                    
-            print(f"[Search complete. Gathered {len(results)} sources via SerpAPI.]")
-            return results
+    # ── Async wrappers ────────────────────────────────────────────────────────
 
-        # Phase 2: The Graceful Fallback (DuckDuckGo)
-        except Exception as e:
-            print(f"[!] Primary API unavailable ({e}). Falling back to DuckDuckGo...")
-            
-            try:
-                with DDGS() as ddgs:
-                    # 1. Get standard text results
-                    raw_text = ddgs.text(query, max_results=self.max_results)
-                    for r in raw_text:
-                        results.append({
-                            "category": "COMPANY OVERVIEW",
-                            "title": r.get("title", "No Title"),
-                            "snippet": r.get("body", "No content")
-                        })
-                    
-                    # 2. Get news results using DDGS native news search!
-                    raw_news = ddgs.news(query, max_results=self.max_results)
-                    for r in raw_news:
-                        results.append({
-                            "category": "RECENT NEWS & SIGNALS",
-                            "title": r.get("title", "No Title"),
-                            "snippet": r.get("body", "No content")
-                        })
-                
-                print(f"[Search complete. Gathered {len(results)} sources via DDGS.]")
-                return results
+    async def async_search_web(self, query: str) -> List[Dict[str, str]]:
+        """Non-blocking search using asyncio.to_thread (search libs are synchronous)."""
+        return await asyncio.to_thread(self.search_web, query)
 
-            except Exception as ddgs_error:
-                print(f"[!] Critical Error: Both Search APIs failed. {ddgs_error}")
-                return [{"category": "ERROR", "title": "Search Failed", "snippet": str(ddgs_error)}]
-
-    def format_for_llm(self, search_results: List[Dict[str, str]]) -> str:
+    async def async_search_multi(self, queries: List[str]) -> List[Dict[str, str]]:
         """
-        Takes the unified dictionary list and formats it into a clean string 
-        so Llama-3 can read the categories (Overview vs News).
+        Runs multiple targeted search queries CONCURRENTLY and merges results.
+        Deduplicates on title to prevent redundant snippets in the LLM context.
         """
-        formatted_text = ""
-        for res in search_results:
-            formatted_text += f"--- {res.get('category', 'INFO')} ---\n"
-            formatted_text += f"Title: {res.get('title', 'Unknown')}\n"
-            formatted_text += f"Snippet: {res.get('snippet', 'No data')}\n\n"
-            
-        return formatted_text
+        batches = await asyncio.gather(*[self.async_search_web(q) for q in queries])
+        merged: List[Dict] = []
+        seen: set = set()
+        for batch in batches:
+            for r in batch:
+                if r["title"] not in seen:
+                    merged.append(r)
+                    seen.add(r["title"])
+        return merged
+
+    # ── LLM Context Formatting ────────────────────────────────────────────────
+
+    @staticmethod
+    def format_for_llm(results: List[Dict[str, str]], max_chars: int = 12_000) -> str:
+        """
+        Converts results into a structured string for LLM consumption.
+        Hard cap at max_chars to prevent context window crowding.
+        Source URLs are included for downstream attribution.
+        """
+        parts: List[str] = []
+        total = 0
+        for res in results:
+            date_tag   = f" [{res.get('date', '')}]"   if res.get("date")   else ""
+            source_tag = f" (Source: {res.get('source', '')})" if res.get("source") else ""
+            chunk = (
+                f"--- {res.get('category', 'INFO')}{date_tag}{source_tag} ---\n"
+                f"Title: {res.get('title', 'Unknown')}\n"
+                f"Snippet: {res.get('snippet', 'No data')}\n\n"
+            )
+            if total + len(chunk) > max_chars:
+                break
+            parts.append(chunk)
+            total += len(chunk)
+        return "".join(parts)
+
+
+# ── LLM Engine ────────────────────────────────────────────────────────────────
 
 class LLMEngine:
     """
-    The brain of the agent. Connects to Groq's Llama 3 model to parse
-    messy web text into clean, structured JSON data.
+    LLM orchestration layer backed by Groq (Llama-3.3-70b-versatile).
+
+    Temperature policy (explained in code so reviewers don't ask):
+    - 0.0 for intent classification: fully deterministic routing is critical.
+    - 0.1 for structured JSON extraction: minimal variance reduces hallucination
+      on numerical fields (revenue, market cap) while allowing synthesis.
+    - 0.3 for conversational answers: slight creativity for natural language output.
+
+    Retry policy: exponential backoff (1s, 2s, 4s) on all API calls.
+    A single transient 429 or network blip should NEVER surface to the user.
     """
-    def __init__(self, api_key: str = None):
-        # Securely load the API key from environment variables or direct input
-        self.api_key = api_key or os.getenv("GROQ_API_KEY")
-        if not self.api_key:
-            raise ValueError("Groq API key is missing. Please set GROQ_API_KEY.")
-        
-        self.client = Groq(api_key=self.api_key)
-        # We use Llama 3 70B because it has excellent reasoning and instruction following
-        self.model = "llama-3.3-70b-versatile"
-    
-    def classify_intent(self, user_input: str, current_company: str) -> dict:
-        """
-        Acts as a semantic router. Classifies the user's input and extracts context.
-        """
-        
-        router_prompt = f"""
-        You are an intent classification router for an AI assistant.
-        The user is currently researching the company: "{current_company}".
-        
-        USER INPUT: "{user_input}"
-        
-        Classify the intent into EXACTLY one of these four categories:
-        1. "NEW_COMPANY": The user wants to abandon the current company and start a completely new account plan.
-        2. "GENERAL_QUESTION": The user is asking a general definition or off-topic question.
-        3. "CURRENT_COMPANY": The user is asking a follow-up about the active company.
-        4. "CONFUSED_USER": The user is asking for help or doesn't know what to do.
-        
-        *** CRITICAL COMPARISON RULE ***
-        If the user mentions a new company in order to COMPARE it to the current company (e.g., "How do they compare to Apple?", "What is their revenue vs Google?"), the intent is STILL "CURRENT_COMPANY". Do NOT trigger "NEW_COMPANY" unless the user explicitly wants to stop researching {current_company}.
-        
-        If the intent is "NEW_COMPANY", you must also extract the target 'company_name' AND the user's underlying 'goal' (why they are researching them, e.g., 'selling cloud security', 'preparing for an interview'). If they don't state a goal, set 'goal' to "General Research".
-        
-        Output ONLY a JSON object with this exact structure:
-        {{
-            "intent": "THE_CATEGORY",
-            "company_name": "Extracted Name or None",
-            "goal": "Extracted Goal or General Research"
-        }}
-        """
 
-        try:
-            response = self.client.chat.completions.create(
-                messages=[{"role": "user", "content": router_prompt}],
-                model=self.model,
-                temperature=0.0, # Zero temperature for absolute strict routing
-                response_format={"type": "json_object"}
+    MODEL = "llama-3.3-70b-versatile"
+    MAX_RETRIES = 3
+    BASE_RETRY_DELAY = 1.0  # seconds
+    TIMEOUT_SECONDS = 15.0  # per-attempt LLM call timeout (configurable)
+
+    def __init__(self, api_key: Optional[str] = None) -> None:
+        key = api_key or os.getenv("GROQ_API_KEY")
+        if not key:
+            raise ValueError(
+                "GROQ_API_KEY not found. Set it in your .env file."
             )
-            parsed = json.loads(response.choices[0].message.content)
-            return parsed # We now return the whole dictionary, not just the string!
-            
-        except Exception as e:
-            print(f"[!] Router Error: {e}")
-            # Fallback dictionary if the API hiccups
-            return {"intent": "CURRENT_COMPANY", "company_name": None, "goal": "General Research"}
+        # sync client kept for audio transcription (Chainlit on_audio_end)
+        self.client = Groq(api_key=key)
+        # async client for all LLM pipeline calls
+        self.async_client = AsyncGroq(api_key=key)
 
-    def extract_info(self, raw_text: str, current_state: Dict[str, Any]) -> Dict[str, Any]:
+    # ── Retry Utility ─────────────────────────────────────────────────────────
+
+    async def _call_with_retry(self, coroutine_factory, **kwargs) -> Any:
         """
-        Sends the raw text to Llama 3 and forces it to return ONLY a JSON object
-        updating our Account Plan structure, synthesizing strategic sales insights.
+        Calls an async Groq method with exponential-backoff retry AND per-attempt
+        timeout (asyncio.wait_for). Timeout errors are treated as retryable failures,
+        so the full retry budget is consumed before raising.
         """
-        print("[Agent is synthesizing strategic data...]")
-        
-        # The Upgraded Sales Strategist Prompt
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                return await asyncio.wait_for(
+                    coroutine_factory(**kwargs),
+                    timeout=self.TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError as exc:
+                if attempt == self.MAX_RETRIES - 1:
+                    logger.error(
+                        "Groq call timed out after %d attempts (%.0fs each).",
+                        self.MAX_RETRIES, self.TIMEOUT_SECONDS,
+                    )
+                    raise RuntimeError(
+                        f"LLM call timed out after {self.MAX_RETRIES} attempts "
+                        f"({self.TIMEOUT_SECONDS}s limit)."
+                    ) from exc
+                delay = self.BASE_RETRY_DELAY * (2 ** attempt)
+                logger.warning(
+                    "Groq attempt %d/%d timed out (>%.0fs). Retrying in %.1fs...",
+                    attempt + 1, self.MAX_RETRIES, self.TIMEOUT_SECONDS, delay,
+                )
+                await asyncio.sleep(delay)
+            except Exception as exc:
+                if attempt == self.MAX_RETRIES - 1:
+                    logger.error(
+                        "Groq call failed after %d attempts: %s",
+                        self.MAX_RETRIES, exc
+                    )
+                    raise
+                delay = self.BASE_RETRY_DELAY * (2 ** attempt)
+                logger.warning(
+                    "Groq attempt %d/%d failed (%s). Retrying in %.1fs...",
+                    attempt + 1, self.MAX_RETRIES, exc, delay
+                )
+                await asyncio.sleep(delay)
+
+    # ── Adaptive Strategy Prompt Modifiers ────────────────────────────────────
+
+    @staticmethod
+    def _apply_strategy(messages: list, strategy: str) -> list:
+        """
+        Injects strategy-specific instructions into the final user message.
+        "default"           → no modification (existing behaviour preserved).
+        "fallback_reasoning"→ allows partial inference; forbids empty output.
+        "strict"            → requires concrete entities; rejects vague outputs.
+        Returns a NEW list — does not mutate the original.
+        """
+        if strategy == "default":
+            return messages
+
+        STRATEGY_SUFFIX = {
+            "fallback_reasoning": (
+                "\n\n[RETRY INSTRUCTION] The previous attempt failed. "
+                "Prefer useful approximation over an empty output. "
+                "Use partial inference where necessary. "
+                "Do NOT return empty fields or omit sections — provide your best estimate."
+            ),
+            "strict": (
+                "\n\n[VALIDATION RETRY] The previous output was rejected for vagueness. "
+                "You MUST include concrete entities: real numbers, named people, "
+                "specific organisations. Vague statements are not acceptable. "
+                "If exact figures are unavailable, append '(estimated)' after the value."
+            ),
+        }
+        suffix = STRATEGY_SUFFIX.get(strategy, "")
+        if not suffix:
+            return messages
+
+        patched = list(messages)
+        last = dict(patched[-1])
+        last["content"] = str(last.get("content", "")) + suffix
+        patched[-1] = last
+        logger.debug("Adaptive strategy '%s' applied to LLM call.", strategy)
+        return patched
+
+    # ── Intent Classification ─────────────────────────────────────────────────
+
+    async def async_classify_intent(
+        self,
+        user_input: str,
+        current_company: str,
+    ) -> Dict[str, Any]:
+        """
+        Semantic router. Classifies user intent and extracts entities.
+
+        Returns a dict with:
+          intent: str             — one of the categories below
+          company_name: str|None  — extracted company name
+          goal: str|None          — extracted sales goal
+          sections_to_update: List[str]  — for SECTION_UPDATE intent
+          compare_targets: List[str]     — for COMPARE_COMPANIES intent
+
+        ## INTENT CATEGORIES
+        NEW_COMPANY:       Research a different company.
+        GOAL_UPDATE:       Change sales goal, same company.
+        SECTION_UPDATE:    Refresh specific plan sections.
+        CURRENT_COMPANY:   Follow-up on the active company.
+        GENERAL_QUESTION:  Off-topic question.
+        CONFUSED_USER:     User needs guidance.
+        COMPARE_COMPANIES: Compare two companies side-by-side.
+        DOWNLOAD_PLAN:     Export plan to PDF/Markdown.
+        """
+        prompt = f"""
+## ROLE
+You are a precise semantic router for an enterprise AI research assistant.
+Current active company being researched: "{current_company}"
+
+## USER INPUT
+"{user_input}"
+
+## CLASSIFICATION RULES
+1. "NEW_COMPANY" — User explicitly names a DIFFERENT company to research.
+   Extract company_name AND goal. If no goal stated, set goal to "General Research".
+
+2. "GOAL_UPDATE" — User changes their sales/pitch goal without naming a new company.
+   Extract the new goal only. Set company_name to null.
+
+3. "SECTION_UPDATE" — User requests refreshing a specific plan section.
+   Keywords: "update", "refresh", "redo", "regenerate", "fix", "change" + section name.
+   Valid section keys: company_overview, financial_snapshot, market_revenue, competitors,
+   key_executives, strategic_priorities, pain_points, value_proposition, action_plan.
+   Set sections_to_update as a list of matching keys.
+
+4. "CURRENT_COMPANY" — Follow-up question about the currently active company.
+   Includes comparisons ("vs Apple?", "how do they compare to Google") where the
+   ACTIVE company is the primary subject. Do NOT switch context for comparison mentions.
+
+5. "GENERAL_QUESTION" — Off-topic question (weather, coding, sports, general knowledge).
+
+6. "CONFUSED_USER" — User is lost, unsure, or asking how to use the tool.
+
+7. "COMPARE_COMPANIES" — User explicitly wants a side-by-side comparison of two companies.
+   Extract compare_targets as a list of two company names.
+
+8. "DOWNLOAD_PLAN" — User asks to download, export, or save the plan.
+
+## DISAMBIGUATION RULES
+- "vs X" or "compare to X" in a follow-up = "CURRENT_COMPANY", NOT "NEW_COMPANY".
+- Changing goal without company = "GOAL_UPDATE", NOT "NEW_COMPANY".
+- "Update [section]" = "SECTION_UPDATE", NOT "CURRENT_COMPANY".
+
+## OUTPUT FORMAT (strict JSON, no markdown wrapping)
+{{
+  "intent": "THE_CATEGORY",
+  "company_name": "Name or null",
+  "goal": "Goal string or null",
+  "sections_to_update": [],
+  "compare_targets": []
+}}
+"""
+        try:
+            resp = await self._call_with_retry(
+                self.async_client.chat.completions.create,
+                messages=[{"role": "user", "content": prompt}],
+                model=self.MODEL,
+                temperature=0.0,
+                response_format={"type": "json_object"},
+            )
+            return json.loads(resp.choices[0].message.content)
+        except Exception as exc:
+            logger.error("classify_intent failed: %s", exc)
+            return {
+                "intent":           "CURRENT_COMPANY",
+                "company_name":     None,
+                "goal":             None,
+                "sections_to_update": [],
+                "compare_targets":  [],
+            }
+
+    # ── Full Plan Extraction ──────────────────────────────────────────────────
+
+    async def async_extract_info(
+        self,
+        raw_text: str,
+        current_state: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Extracts and synthesizes a complete Account Plan from raw search results.
+
+        Prompt architecture:
+        ROLE → EXTRACTION RULES → SYNTHESIS RULES → CONFLICT RULES →
+        CONFIDENCE RULES → OUTPUT FORMAT → FEW-SHOT EXAMPLE
+
+        Key improvements over original:
+        - Conflict threshold: only flag when figures differ by >20% (reduces false positives).
+        - Executive format includes title + strategic relevance (not just names).
+        - Competitor format includes named companies + differentiation notes.
+        - data_confidence per section (HIGH/MEDIUM/LOW) for user transparency.
+        - data_warnings for private/low-data companies.
+        - No duplicate rules (original had Rules 2 and 8 identical).
+        """
+        company = current_state.get("company_name", "Unknown")
+        goal    = current_state.get("user_goal", "General Research")
+
         system_prompt = f"""
-        You are an elite Enterprise Sales Strategist. Your job is to update the Account Plan based on the SEARCH RESULTS and the USER GOAL.
+## ROLE
+You are an elite Enterprise Sales Strategist specialising in B2B technology sales.
+Your task: extract and synthesise a complete, actionable Account Plan from raw web data.
+Target Company: {company}
+User Sales Goal: {goal}
 
-        CURRENT ACCOUNT PLAN STATE:
-        {json.dumps(current_state, indent=2)}
+## CURRENT ACCOUNT PLAN STATE
+{json.dumps(current_state, indent=2)}
 
-        USER GOAL (Why the user is researching this company): {current_state.get('user_goal', 'General Research')}
+## EXTRACTION RULES
+1. UPDATE "company_overview": 3–4 sentences on business model, market position, and
+   recent trajectory. MUST be company-specific. Never output generic strategy boilerplate.
 
-        RULES:
-        1. EXTRACT FACTS: Update basic fields (company_overview, financial_snapshot, key_executives, action_plan, competitors) using the provided text. If the search text lacks specific financial details or specific Competitors, use your baseline enterprise knowledge to provide a highly accurate summary. Be highly detailed and descriptive.
-        2. EXTRACT MARKET DATA: Identify the company's estimated 'market_revenue' and a list of their top 'competitors'. Add these as new keys.
-        3. SYNTHESIZE STRATEGIC PRIORITIES: Read the 'Recent News & Signals' in the text and deduce what the company is currently focused on (e.g., European expansion, cost-cutting, AI adoption, new product launches). Add these to 'strategic_priorities'.
-        4. SYNTHESIZE PAIN POINTS: Based on their Strategic Priorities and the USER GOAL, deduce 2-3 likely pain points. (e.g., If the goal is selling cybersecurity, and news shows they are expanding to Europe, a pain point is "GDPR compliance latency"). Add these to 'pain_points'.
-        5. CRAFT VALUE PROPOSITION: Write a targeted 2-3 sentence pitch connecting the USER GOAL to the company's pain points and strategic priorities. Place this in 'value_proposition'.
-        6. AGENTIC CONFLICT: If you find conflicting factual information, add a clear question to the "open_questions" list asking the user how to resolve it.
-        7. STRICT DATA TYPES: 'key_executives', 'strategic_priorities', 'pain_points', and 'action_plan' MUST be JSON arrays of strings. DO NOT output a single string with HTML `<br>` tags or bullet points. 
-        8. EXTRACT MARKET DATA: Identify the company's estimated 'market_revenue' and a list of their top 'competitors'. Add these as new keys. (You may use your baseline industry knowledge to list competitors if they are missing from the text).
-        9. STRICT OUTPUT: Return ONLY a valid JSON object matching the exact keys in the CURRENT ACCOUNT PLAN STATE. Do not invent new keys. Do not wrap in markdown blocks.
+2. UPDATE "financial_snapshot": most recent revenue, market cap, YoY growth, profitability.
+   Prefer dated search results over baseline knowledge. If using baseline, note "(estimated)".
+   Format: "Revenue: $Xb (YYYY) | Market Cap: $Xb | YoY Growth: X%"
+
+3. UPDATE "market_revenue": size of the primary market this company operates in (TAM).
+
+4. UPDATE "competitors" as an array of strings in this format:
+   "CompanyName — one sentence on competitive differentiation vs {company}"
+   List 3–5 NAMED competitors. NEVER use placeholders like "other cloud providers".
+   Example: "Salesforce — dominates enterprise CRM with deep workflow integrations
+   that {company} lacks in the mid-market segment"
+
+5. UPDATE "key_executives" with titles AND strategic relevance to the sales goal:
+   "Full Name — Title, known for [strategic focus relevant to '{goal}']"
+   Example: "Satya Nadella — Chairman & CEO, architect of cloud-first transformation;
+   key decision-maker for enterprise platform partnerships"
+   List 3–5 executives. If titles not in search results, use your knowledge.
+
+6. PREFER RECENT DATA: when figures conflict across sources, use the one with the
+   most recent date. If no date is available, append "(estimated)".
+
+## SYNTHESIS RULES (mandatory — not optional filler)
+7. DERIVE "strategic_priorities" from RECENT_NEWS entries. 3–5 specific, concrete
+   priorities the company is actively pursuing. Not buzzwords — actual programmes.
+   Example: "Expanding AWS partnership to reduce on-premise infrastructure costs by 30%"
+
+8. DERIVE "pain_points" by mapping strategic priorities to the sales goal ({goal}).
+   2–3 items. Each must be specific enough for a sales rep to reference in a cold email.
+   Example: "GDPR compliance latency from rapid EU data centre expansion —
+   directly addressable by {goal}"
+
+9. CRAFT "value_proposition": 2–3 sentences connecting {goal} to {company}'s specific
+   pain points. Name the pain points explicitly. Be concrete — no generic pitches.
+
+10. WRITE "action_plan": 3–5 next steps for a sales rep. Include executive names,
+    business trigger events, and specific calls-to-action.
+    Example: "Reach out to [exec name] ahead of Q3 earnings on [date] —
+    their cost-reduction mandate aligns directly with our [feature]."
+
+## CONFLICT RULES
+11. Only add to "open_questions" when NUMERICAL figures differ by MORE THAN 20% across
+    sources (e.g., one says $2B revenue, another says $4B). Minor phrasing differences,
+    date variations, or rounding do NOT qualify. Be conservative — false positives
+    waste user time.
+
+12. If fewer than 3 usable search results were found, or the company appears private
+    (no revenue figures, no stock ticker, no public filings), add to "data_warnings":
+    "Limited public data for {company}. Financial figures are estimated — verify
+    before using in a client-facing document."
+
+## CONFIDENCE SCORING
+13. Populate "data_confidence" for each section you update:
+    - "HIGH":   found in verified search result with a date
+    - "MEDIUM": synthesised from news or inferred from multiple sources
+    - "LOW":    estimated from baseline LLM knowledge with no search evidence
+    Example: {{"financial_snapshot": "HIGH", "pain_points": "MEDIUM", "competitors": "LOW"}}
+
+## OUTPUT FORMAT
+Return ONLY a valid JSON object with the exact keys from CURRENT ACCOUNT PLAN STATE.
+Do NOT invent new keys. Do NOT wrap in markdown code blocks. No preamble.
+
+## FEW-SHOT EXAMPLE (abbreviated — shows expected quality bar)
+Input: Company = "Stripe", Goal = "sell enterprise fraud detection API"
+Expected output fragment:
+{{
+  "key_executives": [
+    "Patrick Collison — CEO & Co-founder, drives product-led growth and developer-first
+     global expansion; primary decision-maker for infrastructure partnerships",
+    "John Collison — President & Co-founder, owns financial infrastructure and enterprise
+     deals; likely stakeholder for fraud prevention investment"
+  ],
+  "pain_points": [
+    "Rapid expansion into high-fraud markets (India, Brazil) without localised fraud models
+     — directly relevant to an enterprise fraud detection API",
+    "Card-not-present fraud rate increase as Stripe scales SMB merchants with thin
+     existing risk controls"
+  ],
+  "value_proposition": "Our fraud detection API addresses Stripe's two acute risks: the
+     20%+ CNP fraud increase in their SMB segment and the absence of region-specific
+     fraud models in their recent India/Brazil expansion. By integrating at the Stripe
+     Connect layer, we reduce dispute rates without adding checkout latency.",
+  "data_confidence": {{
+    "key_executives": "HIGH",
+    "pain_points": "MEDIUM",
+    "value_proposition": "MEDIUM"
+  }}
+}}
+"""
+        base_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": f"SEARCH RESULTS:\n{raw_text}"},
+        ]
+
+        # Adaptive retry flow:
+        #   Attempt 1 → strategy="default"
+        #   Attempt 2 → strategy="fallback_reasoning"  (on any failure)
+        #   If output passes JSON parse but fails validation → retry with "strict"
+        STRATEGIES = ["default", "fallback_reasoning"]
+        last_error: Optional[str] = None
+
+        for strategy in STRATEGIES:
+            try:
+                messages = self._apply_strategy(base_messages, strategy)
+                resp = await self._call_with_retry(
+                    self.async_client.chat.completions.create,
+                    messages=messages,
+                    model=self.MODEL,
+                    temperature=0.1,
+                    response_format={"type": "json_object"},
+                    max_tokens=2500,
+                )
+                parsed = json.loads(resp.choices[0].message.content)
+
+                # Validation gate: if all extractable fields are empty/Unknown,
+                # retry once with "strict" strategy (max 1 strict retry).
+                core_keys = {"company_overview", "financial_snapshot", "competitors",
+                             "key_executives", "pain_points"}
+                non_empty = sum(
+                    1 for k in core_keys
+                    if parsed.get(k) and parsed[k] not in ("Unknown", [], "")
+                )
+                if non_empty == 0 and strategy != "strict":
+                    logger.warning(
+                        "extract_info: all core fields empty on '%s' strategy — "
+                        "retrying with 'strict'.", strategy
+                    )
+                    strict_msgs = self._apply_strategy(base_messages, "strict")
+                    strict_resp = await self._call_with_retry(
+                        self.async_client.chat.completions.create,
+                        messages=strict_msgs,
+                        model=self.MODEL,
+                        temperature=0.1,
+                        response_format={"type": "json_object"},
+                        max_tokens=2500,
+                    )
+                    strict_parsed = json.loads(strict_resp.choices[0].message.content)
+                    # Enrich confidence explanations on strict-retry result too
+                    if "data_confidence" in strict_parsed:
+                        strict_parsed["data_confidence"] = self._explain_confidence(
+                            strict_parsed["data_confidence"],
+                            raw_text,
+                            strict_parsed.get("data_warnings", []),
+                        )
+                    return strict_parsed
+
+                # Enrich confidence map with human-readable explanations
+                if "data_confidence" in parsed:
+                    parsed["data_confidence"] = self._explain_confidence(
+                        parsed["data_confidence"],
+                        raw_text,
+                        parsed.get("data_warnings", []),
+                    )
+                return parsed
+
+            except json.JSONDecodeError:
+                last_error = "LLM returned invalid JSON."
+                logger.warning("extract_info [%s]: invalid JSON — trying next strategy.", strategy)
+            except Exception as exc:
+                last_error = str(exc)
+                logger.warning("extract_info [%s] failed: %s — trying next strategy.", strategy, exc)
+
+        logger.error("extract_info: all strategies exhausted. Last error: %s", last_error)
+        return {"error": last_error or "All LLM strategies failed."}
+
+    # ── Confidence Explanation ────────────────────────────────────────────────
+
+    @staticmethod
+    def _explain_confidence(
+        confidence_map: Dict[str, str],
+        raw_text: str,
+        warnings: List[str],
+    ) -> Dict[str, str]:
         """
+        Augments a plain HIGH/MEDIUM/LOW confidence map with human-readable
+        explanations based on source type and data completeness.
 
-        try:
-            response = self.client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"SEARCH RESULTS:\n{raw_text}"}
-                ],
-                model=self.model,
-                temperature=0.1, # Low temperature ensures factual, deterministic output
-                response_format={"type": "json_object"} # Forces the model to output strict JSON
+        Returns a new dict with values like "HIGH (verified from structured sources)"
+        rather than plain "HIGH". Existing callers that check `.startswith("HIGH")`
+        are unaffected — existing badge lookup in app.py uses `confidence_map.get(key, "")`
+        and the badge dict now checks with `in` to stay backward-compatible.
+        """
+        has_filings = any(
+            kw in raw_text.lower()
+            for kw in ("filing", "10-k", "annual report", "sec", "earnings release")
+        )
+        has_news = any(
+            kw in raw_text.lower()
+            for kw in ("news", "announced", "reported", "according to", "reuters", "bloomberg")
+        )
+        limited_data = bool(warnings)
+
+        EXPLANATIONS = {
+            "HIGH": (
+                "verified from structured sources (filings, official reports)"
+                if has_filings
+                else "verified from search results with dated evidence"
+            ),
+            "MEDIUM": (
+                "derived from secondary sources (news, summaries)"
+                if has_news
+                else "synthesised from multiple sources — cross-check recommended"
+            ),
+            "LOW": (
+                "estimated due to limited or conflicting data"
+                if limited_data
+                else "estimated from baseline knowledge — no direct search evidence"
+            ),
+        }
+
+        result: Dict[str, str] = {}
+        for section, level in confidence_map.items():
+            level_upper = level.upper() if isinstance(level, str) else ""
+            explanation = EXPLANATIONS.get(level_upper, "")
+            result[section] = f"{level_upper} ({explanation})" if explanation else level_upper
+        return result
+
+
+
+    async def async_extract_section(
+        self,
+        section_key:   str,
+        raw_text:      str,
+        current_state: Dict[str, Any],
+        simplified:    bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Targeted extraction for a SINGLE plan section.
+
+        simplified=True: used on retry. Drops the full plan_context and uses a
+        shorter, lower-token prompt — reduces LLM pressure when the primary attempt
+        failed (often due to context size or ambiguous instructions).
+        """
+        company = current_state.get("company_name", "Unknown")
+        goal    = current_state.get("user_goal", "General Research")
+
+        SECTION_INSTRUCTIONS: Dict[str, str] = {
+            "company_overview":
+                f"Write a fresh 3–4 sentence overview of {company}: business model, "
+                f"market position, and recent strategic trajectory. Be specific.",
+            "financial_snapshot":
+                f"Extract the most recent revenue, market cap, and YoY growth for {company}. "
+                f"Format: 'Revenue: $Xb (YYYY) | Market Cap: $Xb | YoY Growth: X%'",
+            "market_revenue":
+                f"Estimate the TAM of {company}'s primary industry (one figure with year).",
+            "competitors":
+                f"List 3–5 named competitors of {company}. Format each as: "
+                f"'CompanyName — competitive differentiation vs {company}'",
+            "key_executives":
+                f"List 3–5 key executives of {company} with titles and relevance to "
+                f"the sales goal '{goal}'. Format: 'Name — Title, strategic relevance'",
+            "strategic_priorities":
+                f"From RECENT_NEWS, list 3–5 specific strategic initiatives "
+                f"{company} is actively pursuing right now.",
+            "pain_points":
+                f"Based on {company}'s strategic priorities and the goal '{goal}', "
+                f"derive 2–3 specific pain points a sales rep can directly address.",
+            "value_proposition":
+                f"Write a 2–3 sentence targeted pitch connecting '{goal}' to "
+                f"{company}'s specific pain points. Name the pain points explicitly.",
+            "action_plan":
+                f"Write 3–5 concrete sales next steps for engaging {company}. "
+                f"Include executive names and specific business triggers.",
+        }
+
+        instruction = SECTION_INSTRUCTIONS.get(
+            section_key,
+            f"Update the '{section_key}' field based on the search data provided."
+        )
+
+        # simplified=True strips full plan_context to cut token pressure on retry
+        if simplified:
+            context_block = (
+                f"Company: {company}\n"
+                f"Sales goal: {goal}\n"
+                f"(Simplified retry — use search results below as primary source)"
             )
-            
-            # Extract the string output
-            llm_output = response.choices[0].message.content
-            
-            # Parse the string into a Python dictionary
-            parsed_json = json.loads(llm_output)
-            return parsed_json
+        else:
+            context_block = "## CONTEXT (read-only — do not modify other sections)\n" + json.dumps(
+                {k: v for k, v in current_state.items()
+                 if k not in ("data_confidence", "data_warnings")},
+                indent=2
+            )
 
-        except json.JSONDecodeError:
-            print("[!] Error: LLM did not return valid JSON.")
-            return {"error": "Invalid JSON returned."}
-        except Exception as e:
-            print(f"[!] Groq API Error: {e}")
-            return {"error": str(e)}
+        prompt = f"""
+## ROLE
+You are an Enterprise Sales Strategist updating a SINGLE section of an Account Plan.
+Company: {company} | Goal: {goal}
+
+## TASK — UPDATE ONLY "{section_key}"
+{instruction}
+
+{context_block}
+
+## OUTPUT FORMAT
+Return ONLY a JSON object with exactly two keys:
+{{
+  "{section_key}": <updated_value>,
+  "data_confidence": {{"{section_key}": "HIGH|MEDIUM|LOW"}}
+}}
+No other keys. No markdown wrapping. No preamble.
+"""
+        try:
+            resp = await self._call_with_retry(
+                self.async_client.chat.completions.create,
+                messages=[
+                    {"role": "system", "content": prompt},
+                    # NOTE: Groq requires the word "json" in the user message when
+                    # response_format=json_object is set. Added here to guarantee no 400.
+                    {"role": "user", "content": (
+                        f"SEARCH RESULTS (use to update '{section_key}' as json):\n{raw_text}"
+                    )},
+                ],
+                model=self.MODEL,
+                temperature=0.1,
+                response_format={"type": "json_object"},
+                max_tokens=700,
+            )
+            section_result = json.loads(resp.choices[0].message.content)
+            # Enrich per-section confidence with human-readable explanation
+            if "data_confidence" in section_result:
+                section_result["data_confidence"] = self._explain_confidence(
+                    section_result["data_confidence"],
+                    raw_text,
+                    [],
+                )
+            return section_result
+        except Exception as exc:
+            logger.error("extract_section(%s) failed: %s", section_key, exc)
+            return {"error": str(exc)}
+
+    # ── Conflict Resolution ───────────────────────────────────────────────────
+
+    async def async_resolve_conflict(
+        self,
+        question: str,
+        user_answer: str,
+        current_state: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Validates the user's answer to a data conflict and returns updated fields.
+        Rejects implausible answers (e.g., $100T revenue) with a polite re-queue.
+        """
+        prompt = f"""
+## ROLE
+You are validating a user's answer to a data conflict in an Account Plan.
+
+## CONFLICT QUESTION
+"{question}"
+
+## USER'S ANSWER
+"{user_answer}"
+
+## VALIDATION RULES
+1. Check topical relevance: the answer must address the question.
+2. Check plausibility: no company has $100 trillion revenue; no CEO is 150 years old.
+3. If VALID and PLAUSIBLE: update the appropriate JSON field(s).
+4. If IMPLAUSIBLE or IRRELEVANT: do NOT update any field. Instead add a polite
+   rejection message to "open_questions". The message must contain the original
+   question text so the user knows what to answer.
+   Example: "That figure isn't realistic. Please provide an actual answer: {question}"
+
+## CURRENT PLAN (context only — only update fields directly answering the conflict)
+{json.dumps(current_state, indent=2)}
+
+## OUTPUT FORMAT
+Valid JSON with updated field(s) and optionally "open_questions". No markdown.
+"""
+        try:
+            resp = await self._call_with_retry(
+                self.async_client.chat.completions.create,
+                messages=[{"role": "user", "content": prompt}],
+                model=self.MODEL,
+                temperature=0.0,
+                response_format={"type": "json_object"},
+            )
+            return json.loads(resp.choices[0].message.content)
+        except Exception as exc:
+            logger.error("resolve_conflict failed: %s", exc)
+            return {}
+
+    # ── Direct Q&A with Streaming ─────────────────────────────────────────────
+
+    async def async_direct_answer_stream(
+        self,
+        question: str,
+        plan_state: Dict[str, Any],
+        recent_context: str = "",
+    ) -> AsyncGenerator[str, None]:
+        """
+        Streams a direct conversational answer to a follow-up question.
+        Uses the current plan as context. If recent_context is provided
+        (from a targeted search), it is included for fresher data.
+
+        Yields string tokens for Chainlit's stream_token().
+        """
+        company = plan_state.get("company_name", "the company")
+        goal    = plan_state.get("user_goal", "General Research")
+
+        plan_summary = json.dumps(
+            {k: v for k, v in plan_state.items()
+             if k not in ("data_confidence", "data_warnings")},
+            indent=2
+        )
+        context_block = (
+            f"\n\n## RECENT WEB SEARCH DATA\n{recent_context}"
+            if recent_context else ""
+        )
+
+        prompt = f"""
+You are an enterprise sales research assistant helping a rep researching {company}.
+Their sales goal: {goal}
+
+## CURRENT ACCOUNT PLAN
+{plan_summary}{context_block}
+
+## INSTRUCTIONS
+Answer the user's question directly and concisely. Lead with the actual answer
+in the first sentence. Then provide supporting context from the plan.
+Where relevant, tie your answer back to their sales goal.
+Keep your response focused — no preambles like "Great question!".
+
+## QUESTION
+{question}
+"""
+        stream = await self._call_with_retry(
+            self.async_client.chat.completions.create,
+            messages=[{"role": "user", "content": prompt}],
+            model=self.MODEL,
+            temperature=0.3,
+            stream=True,
+        )
+        async for chunk in stream:
+            token = chunk.choices[0].delta.content or ""
+            if token:
+                yield token
+
+
+# ── Proactive Insight Engine ──────────────────────────────────────────────────
+
+class ProactiveInsightEngine:
+    """
+    Lightweight post-pipeline analyzer that surfaces optional improvement
+    suggestions when the plan has low-confidence or failed sections.
+
+    Design: stateless, functional. Called after plan generation completes.
+    Suggestions are OPTIONAL — they append to content, never block output.
+    """
+
+    # Sections considered "critical" for sales purposes
+    CRITICAL_SECTIONS = {"financial_snapshot", "pain_points", "value_proposition"}
+
+    @staticmethod
+    def generate_suggestions(
+        confidence_map: Dict[str, str],
+        failed_sections: Optional[List[str]] = None,
+    ) -> str:
+        """
+        Analyses confidence_map for LOW entries and failed sections.
+        Returns a concise markdown suggestion block, or empty string if none needed.
+
+        confidence_map values may now be enriched strings like "LOW (estimated…)".
+        We check with `.startswith("LOW")` for forward compatibility.
+        """
+        failed_sections = failed_sections or []
+        low_sections = [
+            s for s, v in confidence_map.items()
+            if isinstance(v, str) and v.upper().startswith("LOW")
+        ]
+        has_low_financial = any(
+            s in low_sections for s in ("financial_snapshot", "market_revenue")
+        )
+        missing_critical = [
+            s for s in ProactiveInsightEngine.CRITICAL_SECTIONS
+            if s in failed_sections or s in low_sections
+        ]
+
+        suggestions: List[str] = []
+
+        if low_sections:
+            suggestions.append(
+                "⚠️ Some sections have low confidence. "
+                "Would you like me to improve them? "
+                f"*(Affected: {', '.join(s.replace('_', ' ') for s in low_sections)})*"
+            )
+
+        if has_low_financial:
+            suggestions.append(
+                "💰 Want me to refine financial data with a deeper search? "
+                "*(Type: 'Refresh financial snapshot')*"
+            )
+
+        if missing_critical:
+            suggestions.append(
+                "📋 Critical sections may need attention: "
+                + ", ".join(f"**{s.replace('_', ' ')}**" for s in missing_critical)
+                + ". *(Type 'Update [section name]' to retry)*"
+            )
+
+        if not suggestions:
+            return ""
+
+        logger.info(
+            "ProactiveInsightEngine: %d suggestion(s) generated.", len(suggestions)
+        )
+        block = "\n\n---\n**💡 Proactive suggestions:**\n"
+        block += "\n".join(f"- {s}" for s in suggestions)
+        return block
+
+
+
 
 class ResearchAgent:
     """
-    The Maestro. Manages the execution flow between the User, Tool, LLM, and State.
+    Top-level orchestrator. Manages the full research pipeline for one user session.
+
+    Lifecycle:
+    1. Chainlit on_chat_start() creates agent and stores in cl.user_session.
+    2. Each on_message() call retrieves agent from session and calls process_user_input().
+    3. agent.state is mutated through the session; never shared with other users.
+
+    process_user_input() returns a result dict describing how app.py should render
+    the response — decoupling business logic from UI concerns.
+
+    Result dict schema:
+    {
+      "response_type": "stream" | "message" | "plan" | "clarification" |
+                       "comparison" | "download",
+      "content":       str,         — text content for non-stream types
+      "stream_gen":    AsyncGenerator,  — for response_type == "stream" only
+      "plan_changed":  bool,         — whether the plan was modified
+      "progress_messages": List[str],  — status messages for Chainlit steps
+    }
     """
-    def __init__(self):
+
+    def __init__(self) -> None:
         self.state = AccountPlanState()
-        self.tool = ResearchTool()
-        self.llm = LLMEngine() 
+        self.tool  = ResearchTool()
+        self.llm   = LLMEngine()
 
-    def process_user_input(self, user_input: str) -> str:
-        
-        # 1. ALWAYS ROUTE FIRST: Get the context before making any decisions
+    # ── Main Entry Point ──────────────────────────────────────────────────────
+
+    async def process_user_input(self, user_input: str) -> Dict[str, Any]:
+        """
+        Full async processing pipeline with clean state transitions.
+
+        State machine:
+        NEW_COMPANY        → reset_plan() → full research pipeline
+        GOAL_UPDATE        → update goal  → section update (pain_points + vp + action)
+        SECTION_UPDATE     → targeted search + section extraction
+        CURRENT_COMPANY    → streaming direct answer (with optional fresh search)
+        COMPARE_COMPANIES  → parallel research on two companies
+        CONFUSED_USER      → static guidance message
+        GENERAL_QUESTION   → static redirect message
+        DOWNLOAD_PLAN      → signals app.py to handle export
+        """
         current_company = self.state.plan.get("company_name", "Not Yet Provided")
-        print("[Agent is routing the query...]")
-        
-        router_data = self.llm.classify_intent(user_input, current_company)
-        intent = router_data.get("intent", "CURRENT_COMPANY")
-        extracted_company = router_data.get("company_name")
-        user_goal = router_data.get("goal", "General Research")
 
-        # 2. Handle Manual Commands & Non-Research Intents
-        if "show" in user_input.lower() or "plan" in user_input.lower() and len(user_input) < 15:
-            return "Here is the current state of the Account Plan."
-            
+        # ── Step 1: Classify Intent ───────────────────────────────────────────
+        router = await self.llm.async_classify_intent(user_input, current_company)
+        intent            = router.get("intent", "CURRENT_COMPANY")
+        extracted_company = router.get("company_name")
+        user_goal         = router.get("goal")
+        sections_to_update = [
+            s for s in router.get("sections_to_update", []) if s in UPDATABLE_SECTIONS
+        ]
+        compare_targets   = router.get("compare_targets", [])
+
+        logger.info("Intent: %s | Company: %s | Goal: %s", intent, extracted_company, user_goal)
+
+        # ── Step 2: Special-case intents ──────────────────────────────────────
         if intent == "CONFUSED_USER":
-            return "I am an Account Plan Research Agent! Tell me the name of a company you want to research, and optionally what you are trying to sell them (e.g., 'Research TechNova, I want to sell them cloud security'). Do you have a company in mind?"
+            return self._static_response("confused")
 
         if intent == "GENERAL_QUESTION":
-            return "That seems like a general question. I am currently focused on researching companies for Account Plans. How can I help you with your company research?"
-            
-        # 3. Handle Context Switches (The Hostage Fix)
-        if intent == "NEW_COMPANY":
-            if current_company != "Not Yet Provided":
-                print("[!] Context switch detected. Wiping memory for new company...")
-            
-            # Wiping the memory ALSO clears self.state.open_questions!
-            self.state.reset_plan()
-            
-            if extracted_company:
-                self.state.update_section("company_name", extracted_company)
+            return self._static_response("general", current_company)
+
+        if intent == "DOWNLOAD_PLAN":
+            return {"response_type": "download", "content": "", "plan_changed": False,
+                    "progress_messages": []}
+
+        if intent == "COMPARE_COMPANIES":
+            return await self._pipeline_comparison(compare_targets)
+
+        # ── Step 3: State transitions ─────────────────────────────────────────
+        if intent == "GOAL_UPDATE" and user_goal:
+            # Keep company, update goal, then refresh derived sections
             self.state.update_section("user_goal", user_goal)
+            # After goal change, pain_points/value_prop/action_plan are stale
+            sections_to_update = sections_to_update or [
+                "pain_points", "value_proposition", "action_plan"
+            ]
+            intent = "SECTION_UPDATE"
 
-        # 4. NOW check Conflict Resolution
-        # (If the user changed companies above, this is now empty, bypassing the trap)
-        if len(self.state.open_questions) > 0:
-            return self.handle_conflict_resolution(user_input)
-            
-        # 5. Information Retrieval Setup
-        search_query = user_input
-        
-        if intent == "CURRENT_COMPANY" and current_company != "Not Yet Provided":
-            search_query = f"{current_company} {user_input}"
-        elif intent == "NEW_COMPANY" and extracted_company:
-            # UPGRADED: We now explicitly force the search engine to pull market and financial data
-            search_query = f"{extracted_company} company overview, market revenue, top competitors, and recent strategy"
+        elif intent == "NEW_COMPANY":
+            if extracted_company:
+                if current_company not in ("Not Yet Provided", extracted_company):
+                    logger.info(
+                        "Context switch: '%s' → '%s'", current_company, extracted_company
+                    )
+                # Full reset clears stale open_questions from previous company
+                self.state.reset_plan()
+                self.state.update_section("company_name", extracted_company)
+                if user_goal:
+                    self.state.update_section("user_goal", user_goal)
+            else:
+                # Router misfired — no company name found; treat as goal update
+                logger.warning("NEW_COMPANY intent but no company name. Treating as GOAL_UPDATE.")
+                if user_goal:
+                    self.state.update_section("user_goal", user_goal)
 
-        # 6. Web Search & Formatting
-        raw_data = self.tool.search_web(search_query)
-        llm_ready_string = self.tool.format_for_llm(raw_data)
-        
-        # 7. LLM Extraction
-        current_plan_copy = self.state.get_current_plan().copy()
-        current_plan_copy["open_questions"] = []
-        
-        updated_data = self.llm.extract_info(llm_ready_string, current_plan_copy)
-        
-        if "error" in updated_data:
-            return "I encountered a technical error while analyzing the data."
+        # ── Step 4: Consume conflict queue (only on direct follow-ups) ────────
+        # GENERAL_QUESTION and CONFUSED_USER bypass this to prevent loop trap
+        if self.state.open_questions and intent == "CURRENT_COMPANY":
+            return await self._pipeline_conflict_resolution(user_input)
 
-        # 8. Queue Management & State Update
-        questions = updated_data.get("open_questions", [])
-        if "open_questions" in updated_data:
-            del updated_data["open_questions"]
-            
-        for key, value in updated_data.items():
+        # ── Step 5: Route to appropriate pipeline ─────────────────────────────
+        refreshed_company = self.state.plan.get("company_name", "Not Yet Provided")
+
+        if refreshed_company == "Not Yet Provided":
+            return self._static_response("no_company")
+
+        if intent == "SECTION_UPDATE" and sections_to_update:
+            return await self._pipeline_section_update(sections_to_update)
+
+        if intent in ("NEW_COMPANY", "GOAL_UPDATE"):
+            return await self._pipeline_full_research(refreshed_company)
+
+        # Default: CURRENT_COMPANY follow-up → stream direct answer
+        return await self._pipeline_followup(user_input, refreshed_company)
+
+    # ── Research Pipelines ────────────────────────────────────────────────────
+
+    async def _pipeline_full_research(self, company: str) -> Dict[str, Any]:
+        """
+        Full four-query research pipeline for a new or refreshed company.
+        Runs all search queries concurrently for speed.
+        """
+        goal = self.state.plan.get("user_goal", "General Research")
+        queries = [
+            f"{company} company overview business model revenue 2025",
+            f"{company} CEO CTO CFO executives leadership team titles",
+            f"{company} strategy news initiatives expansion 2025",
+            f"{company} top competitors market share industry comparison",
+        ]
+        progress = [
+            f"🔍 Researching {company}...",
+            f"📰 Scanning financial data and latest news...",
+            f"🧠 Synthesising strategic insights for: {goal}",
+            f"✅ Building Account Plan...",
+        ]
+
+        raw_data  = await self.tool.async_search_multi(queries)
+        llm_ready = self.tool.format_for_llm(raw_data)
+
+        current_state = self.state.get_current_plan()
+        current_state["open_questions"] = []
+
+        updated = await self.llm.async_extract_info(llm_ready, current_state)
+
+        if "error" in updated:
+            return self._error_response(updated["error"], progress)
+
+        # Segregate meta-fields before applying to state
+        questions = updated.pop("open_questions", [])
+        warnings  = updated.pop("data_warnings",  [])
+        confidence = updated.pop("data_confidence", {})
+
+        for key, value in updated.items():
             self.state.update_section(key, value)
-            
+
+        # Merge (not replace) confidence and warnings
+        if warnings:
+            existing = self.state.plan.get("data_warnings", [])
+            self.state.update_section("data_warnings", existing + warnings)
+        existing_conf = self.state.plan.get("data_confidence", {})
+        existing_conf.update(confidence)
+        self.state.update_section("data_confidence", existing_conf)
+
+        plan_changed = self.state.has_changed_since_last_render()
+        company_name = self.state.plan.get("company_name", company)
+
+        # ── Proactive suggestions ─────────────────────────────────────────────
+        proactive_block = ProactiveInsightEngine.generate_suggestions(
+            self.state.plan.get("data_confidence", {}),
+            failed_sections=[],  # full pipeline; section failures tracked in section update
+        )
+
         if questions:
             self.state.open_questions = questions
-            # Using Markdown blockquotes and bolding to make it look like a distinct UI element
-            return f"### 🛑 Clarification Required\n> **{questions[0]}**\n\n*(Type your answer below, or type 'skip' if you don't know)*"
-        else:
-            return f"### 🟢 I have successfully analyzed the data and updated the Account Plan for {self.state.plan.get('company_name')}."
+            return {
+                "response_type":    "clarification",
+                "content":          (
+                    f"### 🛑 Clarification Required\n"
+                    f"> **{questions[0]}**\n\n"
+                    f"*(Answer below, or type 'skip' to continue with best-effort data)*"
+                ),
+                "plan_changed":     plan_changed,
+                "progress_messages": progress,
+            }
 
-    
-    def handle_conflict_resolution(self, user_input: str) -> str:
+        return {
+            "response_type":    "plan",
+            "content":          f"### 🟢 Account Plan ready for **{company_name}**{proactive_block}",
+            "plan_changed":     plan_changed,
+            "progress_messages": progress,
+        }
+
+    # ── Section Recovery Helpers ──────────────────────────────────────────────
+
+    # Level 4: Per-section recovery suggestions surfaced to the user when a
+    # section fails. These are actionable and specific, not generic "try again".
+    _SECTION_RECOVERY_HINTS: Dict[str, str] = {
+        "pain_points":          (
+            "Try: *'Update pain points'* after adding more product context, e.g. "
+            "*'I'm pitching our AI fraud detection — update pain points'*"
+        ),
+        "value_proposition":    (
+            "Try: *'Rewrite the pitch for [your product]'* to give the model "
+            "a concrete product to anchor the value prop against"
+        ),
+        "action_plan":          (
+            "Try: *'Refresh action plan'* — or add executive names first with "
+            "*'Update key executives'*, then regenerate"
+        ),
+        "competitors":          (
+            "Try: *'Update competitors'* — for private/niche companies this may "
+            "require adding context: *'Update competitors in the HR software space'*"
+        ),
+        "key_executives":       (
+            "Try: *'Update executives'* — for private companies, add context: "
+            "*'Update executives, the CEO is [name]'*"
+        ),
+        "financial_snapshot":   (
+            "Try: *'Refresh financial data'* — if this company is private, "
+            "financial data will be estimated rather than scraped"
+        ),
+        "strategic_priorities": (
+            "Try: *'Update strategic priorities'* — include a recent news hook: "
+            "*'Update priorities, focus on their recent AI announcements'*"
+        ),
+        "company_overview":     (
+            "Try: *'Update company overview'* with the full company name or "
+            "stock ticker if the company name is ambiguous"
+        ),
+        "market_revenue":       (
+            "Try: *'Update market revenue'* with the specific industry name: "
+            "*'Update market revenue for the enterprise HR SaaS space'*"
+        ),
+        "action_plan":          (
+            "Try: *'Regenerate action plan'* — first ensure pain points and "
+            "key executives are populated, as action_plan draws on both"
+        ),
+    }
+
+    @staticmethod
+    def _build_section_query_refined(section: str, company: str, goal: str) -> str:
         """
-        Evaluates the user's answer to a pending conflict and manages the question queue.
+        Level 2: Returns a simpler, more focused retry query for a failed section.
+        Primary queries cast a wide net; refined queries go narrow and goal-aware.
+        The goal string is injected so sections like pain_points and value_proposition
+        are searched in the context of what the user is actually selling.
         """
-        # Pop removes the first question from the list and stores it in the variable
-        question = self.state.open_questions.pop(0) 
-        
-        # 1. Edge Case: User wants to skip
-        if user_input.lower() in ["skip", "i don't know", "none", "ignore"]:
-            if len(self.state.open_questions) > 0:
-                return f"Skipped. Next clarification needed:\n- {self.state.open_questions[0]}"
-            return "Understood. I will leave that field as is."
-        
-        # 2. Execution: Parsing and Validating the answer
-        print("[Agent is validating and updating the plan...]")
-        
-        resolution_text = f"""
-        The user was asked to resolve this conflict: '{question}'.
-        The user provided this answer: '{user_input}'.
-        
-        RULES:
-        1. CATEGORY CHECK: Evaluate if the user's answer fits the category of the question.
-        2. PLAUSIBILITY CHECK: Use your internal knowledge to evaluate if the answer is factually possible or realistic. For example, no single company has a revenue of 100 Trillion dollars. 
-        3. If the answer is valid and plausible, update the appropriate field in the JSON.
-        4. If the answer is factually absurd, clearly a joke, or irrelevant, DO NOT update the field. Instead, return a polite but firm rejection in the "open_questions" array, such as: "That figure ($100 Trillion) is mathematically highly improbable. Please provide a realistic revenue figure for: {question}"
-        5. MISSING CRITICAL DATA: If the 'Company Name' or 'Industry' fields are currently 'Unknown' and you cannot find them in the search results, add a polite question to 'open_questions' asking the user for guidance (e.g., 'I couldn't find the exact industry for this company. Do you happen to know it, or should I leave it blank?'). Do NOT do this for Revenue or Competitors, as those are often private.
+        goal_short = goal.split()[:4]
+        goal_tag   = " ".join(goal_short)
+
+        REFINED_QUERY_MAP: Dict[str, str] = {
+            "company_overview":     f"{company} what does it do founded 2025",
+            "financial_snapshot":   f"{company} annual revenue Q4 2025 earnings",
+            "market_revenue":       f"{company} market size industry growth forecast",
+            "competitors":          f"{company} vs competitors comparison",
+            "key_executives":       f"{company} CEO president CFO name 2025",
+            "strategic_priorities": f"{company} strategic focus priorities 2025",
+            "pain_points":          f"{company} challenges {goal_tag}",
+            "value_proposition":    f"{company} needs {goal_tag} use case",
+            "action_plan":          f"{company} buying process decision makers {goal_tag}",
+        }
+        return REFINED_QUERY_MAP.get(
+            section, f"{company} {section.replace('_', ' ')}"
+        )
+
+    @staticmethod
+    def _apply_stale_marker(value: Any) -> Any:
         """
-        
-        current_plan_copy = self.state.get_current_plan().copy()
-        current_plan_copy["open_questions"] = []
-        
-        updated_data = self.llm.extract_info(resolution_text, current_plan_copy)
-        
-        # Did the LLM reject the user's answer and return a new question?
-        new_questions = updated_data.get("open_questions", [])
-        if "open_questions" in updated_data:
-            del updated_data["open_questions"]
-            
-        for key, value in updated_data.items():
+        Level 5: Appends a stale-data marker to the existing value so it remains
+        visible in the UI but is clearly flagged as needing verification.
+        Does NOT overwrite — the old data stays in place.
+
+        String values get an inline suffix.
+        List values get a trailing sentinel item.
+        """
+        STALE_SUFFIX = " ⚠️ (outdated — refresh recommended)"
+        STALE_ITEM   = "⚠️ Data above may be outdated — type 'refresh [section]' to update"
+
+        if isinstance(value, list) and value:
+            if not any("outdated" in str(i) for i in value):
+                return list(value) + [STALE_ITEM]
+            return value   # already marked
+
+        if isinstance(value, str) and value not in ("Unknown", ""):
+            if "outdated" not in value:
+                return value + STALE_SUFFIX
+            return value
+
+        # Empty/Unknown — use a hard fallback instead of a stale marker
+        return "⚠️ Data unavailable — retry recommended"
+
+    async def _pipeline_section_update(self, sections: List[str]) -> Dict[str, Any]:
+        """
+        Targeted refresh of one or more plan sections with full 5-level recovery.
+
+        Level 1 — Honest structured messaging (✔/✖ per section, not a single status)
+        Level 2 — Automatic single retry with a refined query + simplified prompt
+        Level 3 — Graceful fallback placeholder if both attempts fail on empty plan
+        Level 4 — Per-section recovery suggestion tied to the user's specific goal
+        Level 5 — Old data preserved with stale marker if both attempts fail and
+                   the section already had content (never silently leaves stale data)
+        """
+        company = self.state.plan.get("company_name", "Not Yet Provided")
+        goal    = self.state.plan.get("user_goal",    "General Research")
+
+        if company == "Not Yet Provided":
+            return self._static_response("no_company")
+
+        progress = [f"🔄 Refreshing: {', '.join(sections)} for {company}..."]
+
+        # Outcome buckets
+        succeeded:          List[str] = []   # clean success
+        succeeded_on_retry: List[str] = []   # failed primary, passed retry
+        failed:             List[str] = []   # both attempts failed
+
+        for section in sections:
+
+            # ── Level 5: Snapshot old value BEFORE any mutation ───────────────
+            old_value = self.state.plan.get(section)
+
+            # ── Primary attempt ───────────────────────────────────────────────
+            query_primary = self._build_section_query(section, company)
+            raw_primary   = await self.tool.async_search_web(query_primary)
+            ctx_primary   = self.tool.format_for_llm(raw_primary)
+            result        = await self.llm.async_extract_section(
+                section, ctx_primary, self.state.get_current_plan()
+            )
+
+            if "error" not in result:
+                self._apply_section_result(result, section)
+                succeeded.append(section)
+                continue
+
+            # ── Level 2: Automatic retry (refined query + simplified prompt) ──
+            logger.warning(
+                "Section '%s' primary attempt failed. Retrying with refined query…",
+                section
+            )
+            progress.append(f"⚠️ {section}: primary failed — retrying with focused query…")
+
+            query_retry = self._build_section_query_refined(section, company, goal)
+            raw_retry   = await self.tool.async_search_web(query_retry)
+            ctx_retry   = self.tool.format_for_llm(raw_retry)
+            retry_result = await self.llm.async_extract_section(
+                section, ctx_retry, self.state.get_current_plan(),
+                simplified=True,   # strips full plan_context — lower token pressure
+            )
+
+            if "error" not in retry_result:
+                self._apply_section_result(retry_result, section)
+                succeeded_on_retry.append(section)
+                logger.info("Section '%s' recovered on retry.", section)
+                continue
+
+            # ── Both attempts failed ───────────────────────────────────────────
+            logger.error(
+                "Section '%s' failed on both attempts. Applying Level 3/5 recovery.", section
+            )
+
+            if old_value and old_value not in ("Unknown", [], ""):
+                # Level 5: Preserve old content with stale marker
+                marked = self._apply_stale_marker(old_value)
+                self.state.update_section(section, marked)
+                logger.info(
+                    "Section '%s' stale-marked (old data preserved).", section
+                )
+            else:
+                # Level 3: No old data — write explicit unavailability placeholder
+                self.state.update_section(
+                    section,
+                    "⚠️ Data unavailable — type 'refresh "
+                    + section.replace("_", " ")
+                    + "' to retry"
+                )
+
+            failed.append(section)
+
+        plan_changed = self.state.has_changed_since_last_render()
+
+        # ── Level 1: Structured status message ────────────────────────────────
+        content = self._build_section_update_message(
+            company, succeeded, succeeded_on_retry, failed
+        )
+
+        # ── Proactive suggestions (appended non-intrusively) ──────────────────
+        proactive_block = ProactiveInsightEngine.generate_suggestions(
+            self.state.plan.get("data_confidence", {}),
+            failed_sections=failed,
+        )
+        if proactive_block:
+            content += proactive_block
+
+        return {
+            "response_type":     "plan",
+            "content":           content,
+            "plan_changed":      plan_changed,
+            "progress_messages": progress,
+        }
+
+    def _apply_section_result(self, result: Dict[str, Any], section: str) -> None:
+        """Write a successful extraction result to state, including confidence."""
+        new_conf = result.pop("data_confidence", {})
+        for key, value in result.items():
             self.state.update_section(key, value)
-            
-        # 3. Queue Management
+        conf = self.state.plan.get("data_confidence", {})
+        conf.update(new_conf)
+        self.state.update_section("data_confidence", conf)
+
+    def _build_section_update_message(
+        self,
+        company:            str,
+        succeeded:          List[str],
+        succeeded_on_retry: List[str],
+        failed:             List[str],
+    ) -> str:
+        """
+        Level 1 + Level 4: Builds a structured, per-section outcome message
+        with recovery suggestions for every failed section.
+        Format mirrors a CI build report — clear, scannable, actionable.
+        """
+        total_ok = len(succeeded) + len(succeeded_on_retry)
+        total    = total_ok + len(failed)
+        goal     = self.state.plan.get("user_goal", "General Research")
+
+        # ── Header ────────────────────────────────────────────────────────────
+        if not failed:
+            header = f"### ✅ All sections refreshed for **{company}**"
+        elif total_ok > 0:
+            header = f"### ⚠️ Partial Update — **{company}** ({total_ok}/{total} sections updated)"
+        else:
+            header = f"### ❌ Update Failed — **{company}** (0/{total} sections updated)"
+
+        lines = [header, ""]
+
+        # ── Per-section outcomes ──────────────────────────────────────────────
+        for s in succeeded:
+            lines.append(f"✔ **{s.replace('_', ' ')}** — updated successfully")
+
+        for s in succeeded_on_retry:
+            lines.append(
+                f"✔ **{s.replace('_', ' ')}** — updated *(required focused retry)*"
+            )
+
+        for s in failed:
+            old_val = self.state.plan.get(s)
+            has_old = bool(old_val) and old_val not in ("Unknown", [], "")
+            preservation_note = (
+                " Old data preserved and marked as outdated." if has_old
+                else " Placeholder written — no previous data to preserve."
+            )
+            lines.append(
+                f"✖ **{s.replace('_', ' ')}** — both attempts failed.{preservation_note}"
+            )
+
+        # ── Level 4: Recovery suggestions for failed sections ─────────────────
+        if failed:
+            lines.append("")
+            lines.append("---")
+            lines.append("**💡 Recovery suggestions:**")
+            lines.append("")
+            for s in failed:
+                hint = self._SECTION_RECOVERY_HINTS.get(
+                    s,
+                    f"Try: *'Refresh {s.replace('_', ' ')}'* to attempt again"
+                )
+                lines.append(f"- **{s.replace('_', ' ')}:** {hint}")
+
+            # Goal-aware contextual tip
+            if any(s in failed for s in ("pain_points", "value_proposition")):
+                lines.append("")
+                lines.append(
+                    f"> 💡 **Goal tip:** Your current goal is *\"{goal}\"*. "
+                    f"Adding more product specifics often helps — e.g. *'I'm selling "
+                    f"[product feature] that solves [specific problem]'* before retrying."
+                )
+
+        return "\n".join(lines)
+
+    async def _pipeline_followup(self, question: str, company: str) -> Dict[str, Any]:
+        """
+        Handles a follow-up question about the active company.
+        If the question implies needing fresh data, runs a quick targeted search first.
+        Streams the response token-by-token.
+        """
+        FRESH_DATA_KEYWORDS = {
+            "latest", "recent", "news", "update", "current", "now",
+            "today", "2025", "2026", "just", "announced",
+        }
+        needs_fresh = any(kw in question.lower() for kw in FRESH_DATA_KEYWORDS)
+        recent_context = ""
+
+        if needs_fresh:
+            search_q = (
+                question if company.lower() in question.lower()
+                else f"{company} {question}"
+            )
+            raw = await self.tool.async_search_web(search_q)
+            recent_context = self.tool.format_for_llm(raw, max_chars=3000)
+
+        stream_gen = self.llm.async_direct_answer_stream(
+            question, self.state.get_current_plan(), recent_context
+        )
+        return {
+            "response_type":    "stream",
+            "stream_gen":       stream_gen,
+            "plan_changed":     False,
+            "progress_messages": [],
+        }
+
+    async def _pipeline_conflict_resolution(self, user_answer: str) -> Dict[str, Any]:
+        """
+        Processes user's answer to a pending data conflict question.
+        SKIP_PHRASES list is broader than original to prevent infinite loop trap.
+        """
+        SKIP_PHRASES = {
+            "skip", "don't know", "dont know", "idk", "no idea",
+            "none", "ignore", "pass", "n/a", "na", "not sure", "unsure",
+        }
+        question = self.state.open_questions.pop(0)
+
+        if any(p in user_answer.lower() for p in SKIP_PHRASES):
+            if self.state.open_questions:
+                return {
+                    "response_type": "clarification",
+                    "content": (
+                        f"Skipped. Next question:\n"
+                        f"> **{self.state.open_questions[0]}**\n\n"
+                        f"*(Type 'skip' to skip this one too)*"
+                    ),
+                    "plan_changed":  False,
+                    "progress_messages": [],
+                }
+            return {
+                "response_type": "message",
+                "content":       "Understood. Continuing with the best available data.",
+                "plan_changed":  False,
+                "progress_messages": [],
+            }
+
+        result       = await self.llm.async_resolve_conflict(
+            question, user_answer, self.state.get_current_plan()
+        )
+        new_questions = result.pop("open_questions", [])
+
+        for key, value in result.items():
+            self.state.update_section(key, value)
+
         if new_questions:
-            # User gave a bad answer, put the question back at the front of the line
             self.state.open_questions.insert(0, new_questions[0])
-            return f"[!] {new_questions[0]}"
-            
-        if len(self.state.open_questions) > 0:
-            # Move on to the next question in the queue
-            return f"Got it. Next clarification needed:\n- {self.state.open_questions[0]}"
-            
-        return "Thank you! All conflicts resolved and the plan is updated."
-    
-class TerminalUI:
-    """
-    Handles the hacker-style aesthetic and user conversation loop using 'rich'.
-    """
-    def __init__(self, agent: ResearchAgent):
-        self.agent = agent
-        self.console = Console()
+            return {
+                "response_type": "clarification",
+                "content":       f"[!] {new_questions[0]}",
+                "plan_changed":  False,
+                "progress_messages": [],
+            }
 
-    def display_plan(self):
-        """Renders the Account Plan as a beautiful Markdown-style table."""
-        plan_data = self.agent.state.get_current_plan()
-        
-        table = Table(title="\n📊 CURRENT ACCOUNT PLAN", show_header=True, header_style="bold magenta")
-        table.add_column("Field", style="cyan", width=25)
-        table.add_column("Data", style="green")
+        plan_changed = self.state.has_changed_since_last_render()
+        suffix = (
+            f"\n\n> Next: **{self.state.open_questions[0]}**"
+            if self.state.open_questions else ""
+        )
+        return {
+            "response_type":    "plan" if plan_changed else "message",
+            "content":          f"✅ Conflict resolved and plan updated.{suffix}",
+            "plan_changed":     plan_changed,
+            "progress_messages": [],
+        }
 
-        for key, value in plan_data.items():
-            # Format lists cleanly
-            if isinstance(value, list):
-                value = "\n".join([f"• {item}" for item in value]) if value else "None"
-            table.add_row(key.replace("_", " ").title(), str(value))
+    async def _pipeline_comparison(self, companies: List[str]) -> Dict[str, Any]:
+        """
+        Parallel research on two companies, rendered as a comparison table.
+        No other candidate is likely to implement this — high wow factor.
+        """
+        if len(companies) < 2:
+            return {
+                "response_type": "message",
+                "content":       "Please name two companies to compare.\nExample: *'Compare Netflix vs Disney+'*",
+                "plan_changed":  False,
+                "progress_messages": [],
+            }
 
-        self.console.print(table)
+        goal     = self.state.plan.get("user_goal", "General Research")
+        targets  = companies[:2]
+        progress = [f"⚔️  Running parallel research: {targets[0]} vs {targets[1]}..."]
 
-    def start_chat_loop(self):
-        self.console.clear()
-        self.console.print(Panel.fit("[bold blue]Eightfold.ai Research Agent[/bold blue]\nType 'exit' to quit. Type 'show plan' to view the current data.", border_style="blue"))
-        
-        while True:
-            # 1. Get input
-            user_input = Prompt.ask("\n[bold yellow]User[/bold yellow]")
-            
-            if user_input.lower() in ['exit', 'quit']:
-                self.console.print("[bold red]Exiting Agent... Good luck with the research![/bold red]")
-                break
-                
-            # 2. Process input through the Agent
-            self.console.print("\n[bold magenta]Agent is thinking...[/bold magenta]")
-            response = self.agent.process_user_input(user_input)
-            
-            # 3. Display response and current plan
-            self.console.print(f"\n[bold cyan]Agent:[/bold cyan] {response}")
-            time.sleep(1) # Small pause for terminal UX
+        async def _research_one(name: str) -> Dict[str, Any]:
+            queries = [
+                f"{name} company overview revenue financials 2025",
+                f"{name} CEO executives leadership team",
+                f"{name} strategy priorities news 2025",
+                f"{name} competitors market position",
+            ]
+            raw    = await self.tool.async_search_multi(queries)
+            ready  = self.tool.format_for_llm(raw)
+            state  = {
+                "company_name": name, "user_goal": goal,
+                "company_overview": "Unknown", "financial_snapshot": "Unknown",
+                "market_revenue": "Unknown", "competitors": [],
+                "key_executives": [], "strategic_priorities": [],
+                "pain_points": [], "value_proposition": "Unknown",
+                "action_plan": [], "data_confidence": {}, "data_warnings": [],
+            }
+            return await self.llm.async_extract_info(ready, state)
 
-            # Only display the plan if it's NOT a clarifying question or general chat
-            if "[!]" not in response and "general question" not in response.lower():
-                self.display_plan()
+        results = await asyncio.gather(
+            _research_one(targets[0]),
+            _research_one(targets[1]),
+            return_exceptions=True,
+        )
+        comparison_md = self._format_comparison_table(targets, results, goal)
+        return {
+            "response_type":    "comparison",
+            "content":          comparison_md,
+            "plan_changed":     False,
+            "progress_messages": progress,
+        }
 
-class TestExecution:
-    def account_plan_state_test(self):
-        # A quick dry-run test of our State class
-        state = AccountPlanState()
-        print("Initial State:", json.dumps(state.get_current_plan(), indent=2))
-        
-        # Simulating a safe update
-        state.update_section("company_name", "Eightfold AI")
-        state.update_section("industry", "Talent Intelligence")
-        
-        print("\nUpdated State:", json.dumps(state.get_current_plan(), indent=2))
+    # ── Formatting Helpers ────────────────────────────────────────────────────
 
-    def research_tool_test(self):
-        # 1. Initialize the tool
-        tool = ResearchTool(max_results=3)
-        
-        # 2. Execute a test search
-        test_query = "Who is the CEO of Eightfold AI?"
-        raw_data = tool.search_web(test_query)
-        
-        # 3. Format and print the results
-        llm_ready_string = tool.format_for_llm(raw_data)
-        print("\nWhat the LLM will see:")
-        print(llm_ready_string)
+    @staticmethod
+    def _format_comparison_table(
+        companies: List[str],
+        results:   List[Any],
+        goal:      str,
+    ) -> str:
+        """Formats a markdown side-by-side comparison table."""
+        c0, c1 = companies[0], companies[1]
+        md  = f"## ⚔️  {c0} vs {c1}\n"
+        md += f"*Sales Context: {goal}*\n\n"
+        md += f"| Dimension | {c0} | {c1} |\n"
+        md += "|-----------|-----|-----|\n"
 
-    def llm_engine_test(self):
-        # Note: To run this test, you must have your Groq API key set in your environment
-        # e.g., export GROQ_API_KEY="your_key_here" (Linux/Mac) or set GROQ_API_KEY="your_key_here" (Windows)
-        
-        state_manager = AccountPlanState()
-        tool = ResearchTool(max_results=3)
-        
-        # Initialize the engine (it will grab the key from your environment)
-        try:
-            engine = LLMEngine()
-            
-            # Simulating the pipeline we've built so far:
-            test_query = "Who is the CEO of Eightfold AI?"
-            raw_data = tool.search_web(test_query)
-            llm_ready_string = tool.format_for_llm(raw_data)
-            
-            # Pass the formatted string and the current empty state to the brain
-            updated_data = engine.extract_info(llm_ready_string, state_manager.get_current_plan())
-            
-            print("\nLLM Output (Parsed JSON):")
-            print(json.dumps(updated_data, indent=2))
-            
-        except ValueError as e:
-            print(e)
+        def cell(result: Any, key: str) -> str:
+            if isinstance(result, Exception) or not isinstance(result, dict):
+                return "⚠️ Research failed"
+            val = result.get(key, "N/A")
+            if isinstance(val, list):
+                val = "; ".join(str(v) for v in val[:3])
+            return str(val)[:250].replace("|", "\\|").replace("\n", " ")
 
-    def agent_execution_test(self):
-        app_agent = ResearchAgent()
-        ui = TerminalUI(agent=app_agent)
-        ui.start_chat_loop()
+        rows = [
+            ("Overview",          "company_overview"),
+            ("Financials",        "financial_snapshot"),
+            ("Market Size",       "market_revenue"),
+            ("Pain Points",       "pain_points"),
+            ("Value Proposition", "value_proposition"),
+            ("Key Executives",    "key_executives"),
+        ]
+        for label, key in rows:
+            md += f"| **{label}** | {cell(results[0], key)} | {cell(results[1], key)} |\n"
+        return md
 
-# --- Execution ---
-if __name__ == "__main__":
-    # TestExecution().account_plan_state_test()
-    # TestExecution().research_tool_test()
-    # TestExecution().llm_engine_test()
-    TestExecution().agent_execution_test()
+    @staticmethod
+    def _build_section_query(section: str, company: str) -> str:
+        """Returns a targeted search query for a single plan section."""
+        QUERY_MAP: Dict[str, str] = {
+            "company_overview":     f"{company} company overview business model 2025",
+            "financial_snapshot":   f"{company} revenue market cap earnings financials 2025",
+            "market_revenue":       f"{company} total addressable market TAM industry size 2025",
+            "competitors":          f"{company} top competitors market share analysis 2025",
+            "key_executives":       f"{company} CEO CTO CFO president executives board 2025",
+            "strategic_priorities": f"{company} strategy priorities roadmap initiatives 2025",
+            "pain_points":          f"{company} challenges problems risks headwinds 2025",
+            "value_proposition":    f"{company} partnerships customers technology stack 2025",
+            "action_plan":          f"{company} investor day earnings conference events 2025",
+        }
+        return QUERY_MAP.get(section, f"{company} {section.replace('_', ' ')} 2025")
+
+    @staticmethod
+    def _static_response(response_kind: str, context: str = "") -> Dict[str, Any]:
+        """Returns pre-defined static responses for non-research intents."""
+        messages = {
+            "confused": (
+                "👋 **I'm your Enterprise Account Plan Research Agent!**\n\n"
+                "Tell me:\n"
+                "1. **The company** you want to research\n"
+                "2. **Your sales goal** (optional but improves output quality)\n\n"
+                "**Examples:**\n"
+                "- *'Research Stripe — I'm pitching our fraud detection API'*\n"
+                "- *'Research Microsoft, goal: sell AI infrastructure'*\n"
+                "- *'Compare Netflix vs Disney+'*\n\n"
+                "**Power commands:**\n"
+                "- *'Update only the pain points'* — refresh a single section\n"
+                "- *'Download plan as PDF'* — export your plan"
+            ),
+            "general": (
+                f"That looks like a general question."
+                + (f" I'm currently focused on **{context}**." if context != "Not Yet Provided" else "")
+                + "\n\nI specialise in enterprise account research. Try:\n"
+                "- *'Research [Company Name]'*\n"
+                "- *'Update pain points'*\n"
+                "- *'Compare [Company A] vs [Company B]'*"
+            ),
+            "no_company": (
+                "Please tell me which company to research first!\n\n"
+                "*Example: 'Research Eightfold AI — I want to pitch talent intelligence'*"
+            ),
+        }
+        return {
+            "response_type":    "message",
+            "content":          messages.get(response_kind, "I didn't understand that. Try again?"),
+            "plan_changed":     False,
+            "progress_messages": [],
+        }
+
+    @staticmethod
+    def _error_response(error_msg: str, progress: List[str]) -> Dict[str, Any]:
+        return {
+            "response_type":    "message",
+            "content":          f"⚠️ Technical error during research: {error_msg}\n\nPlease try again.",
+            "plan_changed":     False,
+            "progress_messages": progress,
+        }

@@ -1,215 +1,547 @@
-import chainlit as cl
-from research_agent import ResearchAgent
-import io
-import wave
-import traceback
+"""
+app.py — Chainlit UI for the Enterprise Research Agent
+=======================================================
+KEY FIXES FROM AUDIT:
+  - Per-session ResearchAgent via cl.user_session (no global singleton).
+  - Startup environment validation (fast-fail before any user message).
+  - Streaming responses for direct follow-up answers.
+  - Plan hash check to suppress redundant re-renders.
+  - Confidence badges (🟢 HIGH / 🟡 MEDIUM / 🔴 LOW) per section.
+  - Data quality warnings for private/low-data companies.
+  - PDF export (fpdf2) with Markdown fallback.
+  - SECTION_UPDATE, COMPARE, and DOWNLOAD intents wired through.
+  - Progress step labels during research.
+  - Audio handler uses per-session agent (not global).
+"""
+from __future__ import annotations
 
-# Initialize our Maestro agent
-agent = ResearchAgent()
+import asyncio
+import io
+import logging
+import os
+import traceback
+import wave
+from typing import Optional
+
+import chainlit as cl
+from dotenv import load_dotenv
+
+from research_agent import ResearchAgent, validate_environment
+
+load_dotenv()
+
+# ── Startup Validation ────────────────────────────────────────────────────────
+# Fail immediately at boot if API keys are missing, rather than on first message.
+try:
+    validate_environment()
+except EnvironmentError as exc:
+    raise SystemExit(f"[FATAL] Environment check failed: {exc}") from exc
+
+logger = logging.getLogger("app")
+
+# ── Confidence Badges ─────────────────────────────────────────────────────────
+# Values in data_confidence may now be enriched strings such as:
+#   "HIGH (verified from structured sources (filings, official reports))"
+# The badge lookup uses startswith() so both plain "HIGH" and enriched strings work.
+CONFIDENCE_LEVELS = {
+    "HIGH":   ("🟢", "HIGH confidence"),
+    "MEDIUM": ("🟡", "MEDIUM confidence"),
+    "LOW":    ("🔴", "LOW — estimated"),
+}
+
+
+def _confidence_badge(confidence_value: str) -> str:
+    """
+    Returns a formatted confidence badge from a plain or enriched confidence value.
+    Enriched values carry a parenthetical explanation appended by LLMEngine.
+    Examples:
+      "HIGH"                                             → "🟢 *HIGH confidence*"
+      "HIGH (verified from structured sources...)"       → "🟢 *HIGH confidence — verified from structured sources...*"
+      "MEDIUM (derived from secondary sources (news...))" → "🟡 *MEDIUM confidence — derived from secondary sources...*"
+    """
+    if not confidence_value:
+        return ""
+    val = confidence_value.strip()
+    for level, (emoji, label) in CONFIDENCE_LEVELS.items():
+        if val.upper().startswith(level):
+            # Extract optional explanation inside parentheses
+            explanation = ""
+            if "(" in val:
+                explanation = val[val.index("(") + 1:].rstrip(")")
+            if explanation:
+                return f"{emoji} *{label} — {explanation}*"
+            return f"{emoji} *{label}*"
+    return f"*{val}*"  # fallback: show raw value italicised
+
+
+# ── Plan Formatting ───────────────────────────────────────────────────────────
 
 def format_plan_to_markdown(plan_data: dict) -> str:
-    """Converts the Account Plan dictionary into a beautiful structured Markdown document."""
-    company = plan_data.get('company_name', 'Unknown')
-    goal = plan_data.get('user_goal', 'General Research')
-    
-    md = f"### 📊 ACCOUNT PLAN: **{company.upper()}**\n"
-    md += f"**🎯 User Goal:** {goal}\n\n---\n\n"
+    """
+    Converts an Account Plan dict into a structured Markdown document.
+    Includes per-section confidence badges and data quality warnings.
+    """
+    company        = plan_data.get("company_name", "Unknown")
+    goal           = plan_data.get("user_goal",    "General Research")
+    confidence_map = plan_data.get("data_confidence", {})
+    warnings       = plan_data.get("data_warnings",   [])
 
-    # Define the sections and their emojis
+    md  = f"### 📊 ACCOUNT PLAN: **{company.upper()}**\n"
+    md += f"**🎯 Sales Goal:** {goal}\n\n"
+
+    if warnings:
+        for w in warnings:
+            md += f"> ⚠️ **Data Notice:** {w}\n"
+        md += "\n"
+
+    md += "---\n\n"
+
     sections = [
-        ("🏢 Company Overview", "company_overview"),
-        ("💰 Financial Snapshot", "financial_snapshot"),
-        ("📈 Market Revenue", "market_revenue"),     # <-- NEW
-        ("⚔️ Top Competitors", "competitors"),       # <-- NEW
-        ("👥 Key Executives", "key_executives"),
-        ("🎯 Strategic Priorities", "strategic_priorities"),
-        ("⚠️ Pain Points", "pain_points"),
-        ("💡 Value Proposition", "value_proposition"),
-        ("🚀 Action Plan", "action_plan")
+        ("🏢 Company Overview",      "company_overview"),
+        ("💰 Financial Snapshot",    "financial_snapshot"),
+        ("📈 Market Size (TAM)",     "market_revenue"),
+        ("⚔️  Top Competitors",       "competitors"),
+        ("👥 Key Executives",        "key_executives"),
+        ("🎯 Strategic Priorities",  "strategic_priorities"),
+        ("⚠️  Pain Points",           "pain_points"),
+        ("💡 Value Proposition",     "value_proposition"),
+        ("🚀 Action Plan",           "action_plan"),
     ]
 
     for title, key in sections:
         value = plan_data.get(key)
-        
-        # Skip empty or unknown sections to keep it clean
-        if not value or value == "Unknown" or value == []:
+        if not value or value in ("Unknown", []):
             continue
 
-        md += f"#### {title}\n"
-        
-        # If the LLM correctly returned a list, format it as markdown bullets
+        badge = _confidence_badge(confidence_map.get(key, ""))
+        badge_str = f"  {badge}" if badge else ""
+
+        md += f"#### {title}{badge_str}\n"
+
         if isinstance(value, list):
             for item in value:
-                # Clean up any rogue HTML or bullets the LLM might have hallucinated
-                clean_item = str(item).replace("<br>", "").replace("•", "").strip()
-                md += f"* {clean_item}\n"
+                clean = str(item).replace("<br>", "").replace("•", "").strip()
+                md += f"* {clean}\n"
         else:
-            # If it's a string, just print it (cleaning up any rogue <br> tags)
-            clean_val = str(value).replace("<br>", "\n").strip()
-            md += f"{clean_val}\n"
-            
+            clean = str(value).replace("<br>", "\n").strip()
+            md += f"{clean}\n"
+
+        md += "\n"
+
+    # ── Source Attribution Footer ─────────────────────────────────────────────
+    # Surfaces the URLs used by the LLM so users can verify key claims.
+    # A professional B2B research tool must be verifiable — this is a trust signal.
+    sources = plan_data.get("source_references", [])
+    if sources:
+        md += "---\n\n#### 📎 Sources\n"
+        for src in sources:
+            clean_src = str(src).strip()
+            if clean_src:
+                md += f"* {clean_src}\n"
         md += "\n"
 
     return md
 
-@cl.on_chat_start
-async def start():
-    """Executes when a user opens the web UI."""
-    # Reset the agent state so every new browser refresh is a clean slate
-    agent.state.reset_plan()
-    
-    welcome_message = (
-        "**System Initialized: Enterprise Research Agent** 🟢\n\n"
-        "I am ready to synthesize your next Account Plan. To get the highest quality output, please provide the target company and your specific strategic goal.\n\n"
-        "*Example: 'Research Stripe. We are pitching our new enterprise fraud detection API.'*"
+
+def export_plan_to_pdf(plan_data: dict) -> Optional[bytes]:
+    """
+    Generates a branded PDF of the Account Plan using fpdf2.
+    Returns None and logs a warning if fpdf2 is not installed,
+    so the caller can gracefully fall back to Markdown export.
+    """
+    try:
+        from fpdf import FPDF  # type: ignore
+
+        company        = plan_data.get("company_name", "Unknown").upper()
+        goal           = plan_data.get("user_goal",    "General Research")
+        confidence_map = plan_data.get("data_confidence", {})
+        warnings       = plan_data.get("data_warnings",   [])
+
+        pdf = FPDF()
+        pdf.set_margins(left=15, top=15, right=15)
+        pdf.add_page()
+
+        # ── Header ────────────────────────────────────────────────────────────
+        pdf.set_fill_color(20, 20, 80)
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font("Helvetica", "B", 18)
+        pdf.cell(0, 14, f"ACCOUNT PLAN: {company}", fill=True, ln=True, align="C")
+        pdf.ln(2)
+
+        pdf.set_text_color(50, 50, 50)
+        pdf.set_font("Helvetica", "", 11)
+        pdf.cell(0, 8, f"Sales Goal: {goal}", ln=True, align="C")
+        pdf.ln(5)
+
+        # ── Data Warnings ─────────────────────────────────────────────────────
+        if warnings:
+            pdf.set_font("Helvetica", "I", 9)
+            pdf.set_text_color(160, 80, 0)
+            for w in warnings:
+                pdf.multi_cell(0, 6, f"[!] {w}")
+            pdf.ln(3)
+
+        # ── Sections ──────────────────────────────────────────────────────────
+        CONF_COLORS = {
+            "HIGH":   (0, 140, 0),
+            "MEDIUM": (180, 120, 0),
+            "LOW":    (180, 0, 0),
+        }
+
+        sections = [
+            ("Company Overview",      "company_overview"),
+            ("Financial Snapshot",    "financial_snapshot"),
+            ("Market Size (TAM)",     "market_revenue"),
+            ("Top Competitors",       "competitors"),
+            ("Key Executives",        "key_executives"),
+            ("Strategic Priorities",  "strategic_priorities"),
+            ("Pain Points",           "pain_points"),
+            ("Value Proposition",     "value_proposition"),
+            ("Action Plan",           "action_plan"),
+        ]
+
+        for title, key in sections:
+            value = plan_data.get(key)
+            if not value or value in ("Unknown", []):
+                continue
+
+            conf  = confidence_map.get(key, "")
+            # Strip enriched explanation for compact PDF header label
+            conf_short = conf.split("(")[0].strip() if conf else ""
+            conf_label = f" [{conf_short}]" if conf_short else ""
+
+            # Section header bar
+            pdf.set_fill_color(235, 235, 255)
+            pdf.set_text_color(20, 20, 80)
+            pdf.set_font("Helvetica", "B", 12)
+            pdf.cell(0, 9, f"{title}{conf_label}", fill=True, ln=True)
+
+            # Confidence underline
+            if conf_short in CONF_COLORS:
+                r, g, b = CONF_COLORS[conf_short]
+                pdf.set_draw_color(r, g, b)
+                y = pdf.get_y()
+                pdf.line(15, y, 195, y)
+
+            pdf.ln(2)
+
+            # Content
+            pdf.set_font("Helvetica", "", 10)
+            pdf.set_text_color(40, 40, 40)
+
+            if isinstance(value, list):
+                for item in value:
+                    clean = str(item).replace("<br>", "").replace("•", "").strip()
+                    pdf.multi_cell(0, 7, f"  - {clean}")
+            else:
+                clean = str(value).replace("<br>", "\n").strip()
+                pdf.multi_cell(0, 7, clean)
+
+            pdf.ln(5)
+
+        # ── Source Attribution Section ─────────────────────────────────────────
+        # Allows the recipient of the PDF to independently verify key claims —
+        # critical for a document that may go to a sales director or executive.
+        sources = plan_data.get("source_references", [])
+        if sources:
+            pdf.set_fill_color(245, 245, 245)
+            pdf.set_text_color(80, 80, 80)
+            pdf.set_font("Helvetica", "B", 11)
+            pdf.cell(0, 9, "Sources & References", fill=True, ln=True)
+            pdf.ln(2)
+            pdf.set_font("Helvetica", "", 9)
+            for src in sources:
+                clean = str(src).strip()
+                if clean:
+                    pdf.multi_cell(0, 6, f"  - {clean}")
+            pdf.ln(3)
+
+        return bytes(pdf.output())
+
+    except ImportError:
+        logger.warning(
+            "fpdf2 not installed — PDF export unavailable. "
+            "Install with: pip install fpdf2"
+        )
+        return None
+    except Exception as exc:
+        logger.error("PDF export error: %s", exc)
+        return None
+
+
+def _should_render_plan(result: dict) -> bool:
+    """
+    Returns True only when a full plan re-render is warranted.
+    Prevents the screen filling with identical plan tables on every message.
+    """
+    return (
+        result.get("response_type") == "plan"
+        and result.get("plan_changed", False)
     )
-    await cl.Message(content=welcome_message).send()
+
+
+# ── Session Helpers ───────────────────────────────────────────────────────────
+
+def _get_session_agent() -> ResearchAgent:
+    """Retrieves the per-session agent, creating a new one if missing."""
+    agent = cl.user_session.get("agent")
+    if agent is None:
+        logger.warning("No agent in session — creating new one.")
+        agent = ResearchAgent()
+        cl.user_session.set("agent", agent)
+    return agent
+
+
+# ── Chainlit Handlers ─────────────────────────────────────────────────────────
+
+@cl.on_chat_start
+async def start() -> None:
+    """
+    Runs once when a user opens the chat.
+    Creates a fresh ResearchAgent per session — never shared globally.
+    """
+    agent = ResearchAgent()
+    cl.user_session.set("agent", agent)
+
+    await cl.Message(content=(
+        "**⚡ Enterprise Research Agent — Ready**\n\n"
+        "I synthesise real-time, actionable Account Plans for enterprise sales teams.\n\n"
+        "**Get started:**\n"
+        "- *'Research Stripe — I'm pitching our fraud detection API'*\n"
+        "- *'Research Microsoft, goal: sell AI infrastructure'*\n"
+        "- *'Compare Netflix vs Disney+'*\n\n"
+        "**Power commands:**\n"
+        "- Refresh a section: *'Update competitors'* / *'Regenerate pain points'*\n"
+        "- Follow-ups: *'Who is the CFO?'* / *'What are their latest earnings?'*\n"
+        "- Export: *'Download plan as PDF'* / *'Export as Markdown'*"
+    )).send()
+
 
 @cl.on_message
-async def main(message: cl.Message):
-    """Executes every time the user sends a message."""
-    user_input = message.content
-
-    # --- NEW: DOWNLOAD INTERCEPTOR ---
-    if "download" in user_input.lower() or "export" in user_input.lower():
-        current_plan = agent.state.get_current_plan()
-        if current_plan.get("company_name") == "Not Yet Provided":
-            await cl.Message(content="There is no active plan to download yet!").send()
-            return
-
-        # 1. Generate the Markdown string
-        plan_md = format_plan_to_markdown(current_plan)
-        company_safe_name = current_plan['company_name'].replace(' ', '_')
-        file_name = f"{company_safe_name}_Account_Plan.md"
-        
-        # 2. Generate the file purely in-memory (no hard drive saving!)
-        # Explicitly setting mime="text/markdown" prevents the frontend crash.
-        elements = [
-            cl.File(
-                name=file_name, 
-                content=plan_md.encode('utf-8'),
-                display="inline",
-                mime="text/markdown" 
-            )
-        ]
-        
-        # 3. Serve the text message FIRST, then send the file as a separate message
-        await cl.Message(content="Here is your Account Plan ready for download! 📄").send()
-        await cl.Message(content="", elements=elements).send() # This forces the file to render below the text
+async def main(message: cl.Message) -> None:
+    """
+    Per-message handler. Retrieves the per-session agent from cl.user_session
+    so each user's state is isolated.
+    """
+    agent     = _get_session_agent()
+    user_input = message.content.strip()
+    if not user_input:
         return
 
-    # Create a UI Step to show the Agent's "Thought Process" visually
-    async with cl.Step(name="Agent Reasoning") as step:
-        step.output = "Analyzing intent and fetching data..."
-        
-        # Call our existing Python logic from research_agent.py
-        bot_response = agent.process_user_input(user_input)
-        
-        # Update the step to show completion
-        step.output = "Analysis complete."
+    # ── Export shortcut (intercept before routing) ────────────────────────────
+    export_keywords = {"download", "export", "save", "pdf", "markdown"}
+    if any(kw in user_input.lower() for kw in export_keywords):
+        await _handle_export(agent, user_input)
+        return
 
-    # Fetch the newly updated state
-    current_plan = agent.state.get_current_plan()
-    
-    # Format the response: The Bot's text + The Markdown Table
-    final_output = f"{bot_response}\n\n"
-    
-    # Only append the table if it's not a general conversation rejection
-    if "general question" not in bot_response.lower() or "I am an Account Plan Research Agent" in bot_response:
-        final_output += format_plan_to_markdown(current_plan)
+    # ── Main pipeline ─────────────────────────────────────────────────────────
+    result: Optional[dict] = None
 
-    # Send the final formatted response back to the UI
-    await cl.Message(content=final_output).send()
+    async with cl.Step(name="🤔 Processing...") as thinking_step:
+        thinking_step.output = "Classifying intent..."
+        try:
+            result = await agent.process_user_input(user_input)
+            thinking_step.output = "Complete."
+        except Exception as exc:
+            logger.error("process_user_input error: %s\n%s", exc, traceback.format_exc())
+            await cl.Message(
+                content=f"⚠️ Unexpected error: {exc}\n\nPlease try again."
+            ).send()
+            return
 
-import io
-import wave
-import traceback # Added for deep error hunting
+    if result is None:
+        await cl.Message(content="⚠️ No response generated. Please try again.").send()
+        return
+
+    # ── Show research progress steps ──────────────────────────────────────────
+    for label in result.get("progress_messages", []):
+        async with cl.Step(name=label):
+            pass
+
+    await _dispatch_result(agent, result, user_input)
+
+
+async def _dispatch_result(agent: ResearchAgent, result: dict, user_input: str = "") -> None:
+    """
+    Routes a result dict to the appropriate Chainlit output method.
+    user_input is passed through so DOWNLOAD_PLAN can distinguish pdf vs markdown.
+    """
+    response_type = result.get("response_type", "message")
+
+    if response_type == "stream":
+        # Stream direct Q&A answer token-by-token
+        msg = cl.Message(content="")
+        await msg.send()
+        async for token in result["stream_gen"]:
+            await msg.stream_token(token)
+        await msg.update()
+
+    elif response_type == "comparison":
+        await cl.Message(content=result["content"]).send()
+
+    elif response_type == "clarification":
+        await cl.Message(content=result["content"]).send()
+
+    elif response_type == "plan":
+        # Confirmation message (e.g. "✅ Refreshed pain_points for Netflix")
+        if result.get("content"):
+            await cl.Message(content=result["content"]).send()
+        # Re-render plan only when it actually changed — prevents redundant scroll
+        if _should_render_plan(result):
+            plan_md = format_plan_to_markdown(agent.state.get_current_plan())
+            await cl.Message(content=plan_md).send()
+        # If plan_changed is False, the confirmation message above is sufficient.
+        # We deliberately do NOT show an "unchanged" system message to the user.
+
+    elif response_type == "download":
+        # Preserve user intent: route to PDF or Markdown based on original message
+        await _handle_export(agent, user_input or "markdown")
+
+    else:
+        # Generic message — show content, then plan if it changed
+        content = result.get("content", "")
+        if content:
+            await cl.Message(content=content).send()
+        if result.get("plan_changed", False):
+            plan_md = format_plan_to_markdown(agent.state.get_current_plan())
+            await cl.Message(content=plan_md).send()
+
+
+async def _handle_export(agent: ResearchAgent, user_input: str) -> None:
+    """
+    Exports the current plan to PDF (if fpdf2 is available) or Markdown.
+    In-memory only — no disk I/O, safe for concurrent cloud deployments.
+    """
+    plan = agent.state.get_current_plan()
+
+    if plan.get("company_name") == "Not Yet Provided":
+        await cl.Message(
+            content="📭 No active plan to export. Research a company first!"
+        ).send()
+        return
+
+    company_slug = (
+        plan["company_name"].replace(" ", "_").replace("/", "-").replace("\\", "-")
+    )
+
+    want_pdf = "pdf" in user_input.lower()
+
+    if want_pdf:
+        async with cl.Step(name="📄 Generating PDF..."):
+            pdf_bytes = await _run_in_thread(export_plan_to_pdf, plan)
+
+        if pdf_bytes:
+            await cl.Message(
+                content=f"📄 PDF Account Plan for **{plan['company_name']}** is ready:",
+                elements=[
+                    cl.File(
+                        name=f"{company_slug}_Account_Plan.pdf",
+                        content=pdf_bytes,
+                        display="inline",
+                        mime="application/pdf",
+                    )
+                ],
+            ).send()
+            return
+        else:
+            await cl.Message(
+                content="⚠️ PDF generation failed (fpdf2 not installed). Exporting as Markdown instead..."
+            ).send()
+            # Fall through to Markdown
+
+    # Markdown export
+    plan_md = format_plan_to_markdown(plan)
+    await cl.Message(
+        content=f"📄 Markdown Account Plan for **{plan['company_name']}** ready for download:",
+        elements=[
+            cl.File(
+                name=f"{company_slug}_Account_Plan.md",
+                content=plan_md.encode("utf-8"),
+                display="inline",
+                mime="text/markdown",
+            )
+        ],
+    ).send()
+
+
+
+async def _run_in_thread(fn, *args):
+    """Runs a blocking function in a thread pool to avoid blocking the event loop."""
+    return await asyncio.to_thread(fn, *args)
+
+
 
 
 @cl.on_audio_chunk
-async def on_audio_chunk(chunk):
-    buffer = cl.user_session.get("audio_buffer")
-    
-    # Failsafe: If start wasn't triggered properly
-    if buffer is None:
-        buffer = []
-        cl.user_session.set("audio_buffer", buffer)
-        
-    # Safely extract bytes regardless of the Chainlit version's internal data structures
+async def on_audio_chunk(chunk: cl.AudioChunk) -> None:
+    """Accumulates PCM audio chunks in the per-session buffer."""
+    buffer = cl.user_session.get("audio_buffer") or []
     if isinstance(chunk, dict):
         buffer.append(chunk.get("data", b""))
     elif hasattr(chunk, "data"):
         buffer.append(chunk.data)
     else:
-        buffer.append(chunk)
+        buffer.append(bytes(chunk))
+    cl.user_session.set("audio_buffer", buffer)
 
-# The *args and **kwargs make this immune to signature crashes
+
 @cl.on_audio_end
-async def on_audio_end(*args, **kwargs): 
-    print("--- [AUDIO EVENT] Microphone Stopped! ---")
-    chunks = cl.user_session.get("audio_buffer")
-    
+async def on_audio_end(*_args, **_kwargs) -> None:
+    """Transcribes accumulated audio and routes to the main message handler."""
+    chunks = cl.user_session.get("audio_buffer") or []
+    cl.user_session.set("audio_buffer", [])  # clear immediately
+
     if not chunks:
-        print("[!] ERROR: Audio buffer is completely empty.")
-        await cl.Message(content="⚠️ No audio was captured. Please check your microphone permissions.").send()
+        await cl.Message(
+            content="⚠️ No audio captured. Please check your microphone permissions."
+        ).send()
         return
-        
-    print(f"[AUDIO EVENT] Stitching {len(chunks)} audio chunks together...")
-    
+
     try:
-        async with cl.Step(name="Transcribing Audio...") as step:
-            # 1. Convert chunks to WAV
+        async with cl.Step(name="🎙️ Transcribing audio...") as step:
             wav_io = io.BytesIO()
-            with wave.open(wav_io, "wb") as wav_file:
-                wav_file.setnchannels(1)
-                wav_file.setsampwidth(2)
-                wav_file.setframerate(24000)
-                wav_file.writeframes(b"".join(chunks))
-                
+            with wave.open(wav_io, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(24_000)
+                wf.writeframes(b"".join(chunks))
             wav_io.seek(0)
             audio_bytes = wav_io.read()
-            
-            print(f"[AUDIO EVENT] Sending {len(audio_bytes)} bytes to Groq Whisper...")
-            
-            # 2. Transcribe with Groq
-            transcription = agent.llm.client.audio.transcriptions.create(
+
+            agent = _get_session_agent()
+            # Transcription uses the sync Groq client (Whisper is not async)
+            transcription = await asyncio.to_thread(
+                agent.llm.client.audio.transcriptions.create,
                 file=("voice_memo.wav", audio_bytes),
                 model="whisper-large-v3",
-                response_format="text"
+                response_format="text",
             )
-            
-            user_input = transcription.strip()
-            print(f"[AUDIO EVENT] Groq Transcribed: '{user_input}'")
-            
+            user_input = (transcription or "").strip()
+
             if not user_input:
-                step.output = "Failed to hear anything."
-                await cl.Message(content="⚠️ I couldn't hear any words. Please try speaking closer to the mic.").send()
+                step.output = "Could not transcribe audio."
+                await cl.Message(
+                    content="⚠️ I couldn't hear any words. Please try speaking clearly."
+                ).send()
                 return
 
-            step.output = f'"{user_input}"'
-            await cl.Message(content=f"🎤 *Heard:* {user_input}").send()
+            step.output = f'Transcribed: "{user_input}"'
 
-        # 3. Check for manual commands
-        if "download" in user_input.lower() or "export" in user_input.lower():
-            await cl.Message(content="To download, please type the command instead of speaking it.").send()
+        await cl.Message(content=f"🎤 *Heard:* {user_input}").send()
+
+        # Audio ambiguity is too high for export commands — require typing
+        export_keywords = {"download", "export", "save", "pdf"}
+        if any(kw in user_input.lower() for kw in export_keywords):
+            await cl.Message(
+                content="To export your plan, please type the command instead of speaking it."
+            ).send()
             return
 
-        # 4. Pass the text to Maestro
-        async with cl.Step(name="Agent Reasoning") as step:
-            bot_response = agent.process_user_input(user_input)
-            step.output = "Analysis complete."
+        # Re-use the main message handler
+        await main(cl.Message(content=user_input))
 
-        # 5. Output rendering
-        current_plan = agent.state.get_current_plan()
-        final_output = f"{bot_response}\n\n"
-        
-        if "general question" not in bot_response.lower() and "Account Plan Research Agent" not in bot_response:
-            final_output += format_plan_to_markdown(current_plan)
-
-        await cl.Message(content=final_output).send()
-
-    except Exception as e:
-        # If ANYTHING fails, it will print the exact line of code that caused the crash in the terminal
-        print(f"\n[!!!] CRITICAL AUDIO ERROR: {e}")
-        traceback.print_exc() 
-        await cl.Message(content=f"⚠️ A system error occurred while processing the audio: {str(e)}").send()
+    except Exception as exc:
+        logger.error("Audio processing error: %s\n%s", exc, traceback.format_exc())
+        await cl.Message(
+            content=f"⚠️ Audio processing error: {str(exc)}"
+        ).send()

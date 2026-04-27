@@ -182,7 +182,6 @@ SERP_API_KEY=        # Optional — higher-quality search; falls back to DuckDuc
 ## 🔮 Future Improvements
 
 - Redis/SQLite session persistence
-- Unit + integration test suite for pipelines and validator
 - Clickable per-section source attribution
 - TTS voice output for hands-free walkthroughs
 

@@ -1,18 +1,38 @@
-# Use a lightweight Python base image
+# Use lightweight Python image
 FROM python:3.11-slim
 
-# Set the working directory inside the container
+# Prevent Python from writing .pyc files and buffering stdout
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Set working directory
 WORKDIR /app
 
-# Copy the requirements file and install dependencies
+# Install system dependencies (IMPORTANT for stability + fonts)
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
+
+# Upgrade pip (prevents install issues)
+RUN pip install --upgrade pip
+
+# Copy requirements first (better caching)
 COPY requirements.txt .
+
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy all your project files into the container
+# Copy project files
 COPY . .
 
-# Hugging Face Spaces route web traffic through port 7860
+# Ensure DejaVu font exists for PDF export
+# (your code expects DejaVuSans.ttf in project root)
+RUN cp /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf ./DejaVuSans.ttf || true
+
+# Hugging Face Spaces expects this port
 EXPOSE 7860
 
-# The command to start the Chainlit server on the correct port
+# Start Chainlit server
 CMD ["chainlit", "run", "app.py", "--host", "0.0.0.0", "--port", "7860"]

@@ -4,3 +4,5 @@ python-dotenv==1.2.1
 ddgs==9.14.1
 groq==1.2.0
 pytest==9.0.3
+fpdf==1.7.2
+uvicorn==0.38.0

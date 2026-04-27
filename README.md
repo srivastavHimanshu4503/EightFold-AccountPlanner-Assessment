@@ -1,12 +1,3 @@
----
-title: Enterprise Account Plan Research Agent
-emoji: 🚀
-colorFrom: blue
-colorTo: purple
-sdk: docker
-app_file: app.py
----
-
 # 🧠 Enterprise Account Plan Research Agent
 *Eightfold.ai AI Agent Assignment — Problem Statement 1: Company Research Assistant*
 

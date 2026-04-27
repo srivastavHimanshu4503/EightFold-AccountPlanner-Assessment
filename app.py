@@ -740,6 +740,13 @@ async def on_audio_chunk(chunk: cl.AudioChunk) -> None:
         buffer.append(bytes(chunk))
     cl.user_session.set("audio_buffer", buffer)
 
+@cl.on_audio_start
+async def on_audio_start() -> bool:
+    """
+    Called when the user clicks the microphone button.
+    Must return True to accept the incoming audio connection.
+    """
+    return True
 
 @cl.on_audio_end
 async def on_audio_end(*_args, **_kwargs) -> None:

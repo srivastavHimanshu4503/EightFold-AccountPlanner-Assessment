@@ -127,8 +127,8 @@ TTL Cache               Adaptive Retry Loop
 
 ```bash
 # 1. Clone
-git clone https://github.com/YOUR_USERNAME/enterprise-research-agent.git
-cd enterprise-research-agent
+git clone https://github.com/srivastavHimanshu4503/EightFold-AccountPlanner-Assessment.git
+cd EightFold-AccountPlanner-Assessment
 
 # 2. Install
 pip install -r requirements.txt
@@ -152,8 +152,6 @@ SERP_API_KEY=        # Optional — higher-quality search; falls back to DuckDuc
 ```
 
 ---
-
-## 📸 Demo
 
 ## 📸 Demo
 

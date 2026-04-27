@@ -164,9 +164,13 @@ SERP_API_KEY=        # Optional — higher-quality search; falls back to DuckDuc
 
 ## 📸 Demo
 
-*(Add demo GIF here)*
+## 📸 Demo
 
-*(Add Account Plan screenshot with confidence badges here)*
+### 🎬 End-to-End Flow
+![Demo GIF](images/demo_homePage.png)
+
+### 📊 Sample Account Plan Output
+![Account Plan Output](images/account_plan.png)
 
 **Typical session:**
 1. *"Research Stripe — I'm pitching our fraud detection API"*

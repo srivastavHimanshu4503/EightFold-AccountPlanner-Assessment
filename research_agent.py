@@ -1370,6 +1370,31 @@ class ResearchAgent:
         self.state = AccountPlanState()
         self.tool  = ResearchTool()
         self.llm   = LLMEngine()
+        # Real-time progress callback — injected by app.py before each pipeline call.
+        # Signature: async def callback(label: str) -> None
+        # When set, _emit_progress() fires it during pipeline execution so Chainlit
+        # steps appear AS each stage completes, not all at once after the pipeline returns.
+        self._progress_cb: Optional[Any] = None
+
+    def set_progress_callback(self, cb: Any) -> None:
+        """
+        Injects an async callable that app.py uses to display real-time steps.
+        Called once before process_user_input() on every message.
+        Resets to None after each call to prevent stale callbacks across turns.
+        """
+        self._progress_cb = cb
+
+    async def _emit_progress(self, label: str) -> None:
+        """
+        Fires the injected progress callback if one is set.
+        Safe to call even when no callback is registered (terminal/test mode).
+        """
+        if self._progress_cb is not None:
+            try:
+                await self._progress_cb(label)
+            except Exception as exc:
+                # Never let a UI callback crash the pipeline
+                logger.warning("_emit_progress callback raised: %s", exc)
 
     # ── Main Entry Point ──────────────────────────────────────────────────────
 
@@ -1445,7 +1470,7 @@ class ResearchAgent:
 
         if intent == "DOWNLOAD_PLAN":
             return {"response_type": "download", "content": "", "plan_changed": False,
-                    "progress_messages": []}
+                    "progress_messages": [], "suggestions": []}
 
         if intent == "SHOW_PLAN":
             # User explicitly wants to see the plan rendered — always show it.
@@ -1512,48 +1537,51 @@ class ResearchAgent:
     async def _pipeline_full_research(self, company: str) -> Dict[str, Any]:
         """
         Full four-query research pipeline for a new or refreshed company.
-        Runs all search queries concurrently for speed.
+
+        Progress is emitted via _emit_progress() AT THE MOMENT each stage begins,
+        not collected into a list and returned after completion. This ensures
+        Chainlit steps appear in real-time during the 5-15 second research window.
         """
         goal = self.state.plan.get("user_goal", "General Research")
+
+        # Stage 1: Web search — emit before the blocking I/O starts
+        await self._emit_progress(f"🔍 Researching {company}...")
         queries = [
             f"{company} company overview business model revenue 2025",
             f"{company} CEO CTO CFO executives leadership team titles",
             f"{company} strategy news initiatives expansion 2025",
             f"{company} top competitors market share industry comparison",
         ]
-        progress = [
-            f"🔍 Researching {company}...",
-            f"📰 Scanning financial data and latest news...",
-            f"🧠 Synthesising strategic insights for: {goal}",
-            f"✅ Building Account Plan...",
-        ]
+        raw_data = await self.tool.async_search_multi(queries)
 
-        raw_data  = await self.tool.async_search_multi(queries)
+        # Stage 2: Format — instant, but signals transition to the user
+        await self._emit_progress("📰 Scanning financial data and latest news...")
         llm_ready = self.tool.format_for_llm(raw_data)
 
-        # Collect unique source URLs for attribution before passing to LLM
+        # Collect unique source URLs for attribution
         source_urls = list(dict.fromkeys(
             r["source"] for r in raw_data
-            if r.get("source") and r["source"] not in ("SerpAPI", "SerpAPI/News",
-                                                        "SerpAPI/FAQ", "DDGS",
-                                                        "DDGS/News", "N/A")
+            if r.get("source") and r["source"] not in (
+                "SerpAPI", "SerpAPI/News", "SerpAPI/FAQ", "DDGS", "DDGS/News", "N/A"
+            )
         ))
 
+        # Stage 3: LLM extraction — emit before the ~5s LLM call
+        await self._emit_progress(f"🧠 Synthesising strategic insights for: {goal}")
         current_state = self.state.get_current_plan()
         current_state["open_questions"] = []
-
         updated = await self.llm.async_extract_info(llm_ready, current_state)
 
         if "error" in updated:
-            return self._error_response(updated["error"], progress)
+            return self._error_response(updated["error"], [])
 
-        # Segregate meta-fields BEFORE validation so the validator only sees
-        # actual plan fields — not open_questions, data_warnings, data_confidence.
+        # Stage 4: Validation and state write
+        await self._emit_progress("✅ Validating and building Account Plan...")
+
         questions  = updated.pop("open_questions", [])
         warnings   = updated.pop("data_warnings",  [])
         confidence = updated.pop("data_confidence", {})
 
-        # Validate LLM output before writing to state
         cleaned, issues = PlanOutputValidator.validate(updated)
         if issues:
             logger.warning(
@@ -1564,13 +1592,11 @@ class ResearchAgent:
         for key, value in updated.items():
             self.state.update_section(key, value)
 
-        # Persist source URLs collected from raw search results
         if source_urls:
             existing_sources = self.state.plan.get("source_references", [])
             merged_sources = list(dict.fromkeys(existing_sources + source_urls))
             self.state.update_section("source_references", merged_sources)
 
-        # Merge (not replace) confidence and warnings
         if warnings:
             existing = self.state.plan.get("data_warnings", [])
             self.state.update_section("data_warnings", existing + warnings)
@@ -1581,34 +1607,36 @@ class ResearchAgent:
         plan_changed = self.state.has_changed_since_last_render()
         company_name = self.state.plan.get("company_name", company)
 
-        # ── Proactive suggestions (deduplicated across repeated calls) ──────────
         raw_suggestions = ProactiveInsightEngine.generate_suggestions(
             self.state.plan.get("data_confidence", {}),
-            failed_sections=[],  # full pipeline; section failures tracked in section update
+            failed_sections=[],
         )
         suggestions = [s for s in raw_suggestions if s not in self.state._seen_suggestions]
         self.state._seen_suggestions.update(suggestions)
 
+        # Clear callback after use — prevents stale callbacks across conversation turns
+        self._progress_cb = None
+
         if questions:
             self.state.open_questions = questions
             return {
-                "response_type":    "clarification",
-                "content":          (
+                "response_type":     "clarification",
+                "content":           (
                     f"### 🛑 Clarification Required\n"
                     f"> **{questions[0]}**\n\n"
                     f"*(Answer below, or type 'skip' to continue with best-effort data)*"
                 ),
-                "plan_changed":     plan_changed,
-                "progress_messages": progress,
-                "suggestions": [],
+                "plan_changed":      plan_changed,
+                "progress_messages": [],   # already emitted in real-time
+                "suggestions":       [],
             }
 
         return {
-            "response_type":    "plan",
-            "content":          f"### 🟢 Account Plan ready for **{company_name}**",
-            "suggestions":      suggestions,
-            "plan_changed":     plan_changed,
-            "progress_messages": progress,
+            "response_type":     "plan",
+            "content":           f"### 🟢 Account Plan ready for **{company_name}**",
+            "suggestions":       suggestions,
+            "plan_changed":      plan_changed,
+            "progress_messages": [],   # already emitted in real-time
         }
 
     # ── Section Recovery Helpers ──────────────────────────────────────────────
@@ -1723,7 +1751,7 @@ class ResearchAgent:
         if company == "Not Yet Provided":
             return self._static_response("no_company")
 
-        progress = [f"🔄 Refreshing: {', '.join(sections)} for {company}..."]
+        await self._emit_progress(f"🔄 Refreshing: {', '.join(sections)} for {company}...")
 
         # Outcome buckets
         succeeded:          List[str] = []   # clean success
@@ -1767,7 +1795,12 @@ class ResearchAgent:
                 "Section '%s' primary attempt failed. Retrying with refined query…",
                 section
             )
-            progress.append(f"⚠️ {section}: primary failed — retrying with focused query…")
+            # BUG FIX: `progress` was never declared in this scope — it was a
+            # leftover from the old list-based design. Progress is now emitted
+            # in real-time via _emit_progress(), not collected into a list.
+            await self._emit_progress(
+                f"⚠️ {section.replace('_', ' ')}: primary failed — retrying with focused query…"
+            )
 
             query_retry = self._build_section_query_refined(section, company, goal)
             raw_retry   = await self.tool.async_search_web(query_retry)
@@ -1826,7 +1859,7 @@ class ResearchAgent:
             "content":           content,
             "suggestions":       suggestions,
             "plan_changed":      plan_changed,
-            "progress_messages": progress,
+            "progress_messages": [],  # emitted in real-time via _emit_progress
         }
 
     def _apply_section_result(self, result: Dict[str, Any], section: str) -> None:
@@ -2084,7 +2117,7 @@ class ResearchAgent:
             "response_type":    "comparison",
             "content":          comparison_md,
             "plan_changed":     False,
-            "progress_messages": progress,
+            "progress_messages": [],  # emitted in real-time via _emit_progress
             "suggestions": [],
         }
 
@@ -2183,6 +2216,6 @@ class ResearchAgent:
             "response_type":    "message",
             "content":          f"⚠️ Technical error during research: {error_msg}\n\nPlease try again.",
             "plan_changed":     False,
-            "progress_messages": progress,
+            "progress_messages": [],  # emitted in real-time via _emit_progress
             "suggestions": [],
         }

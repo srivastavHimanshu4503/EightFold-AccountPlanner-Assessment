@@ -92,73 +92,218 @@ def _confidence_badge(confidence_value: str) -> str:
     return f"*{val}*"
 
 
+# ── Text Wrapping ─────────────────────────────────────────────────────────────
+
+def wrap_text(text: str, max_len: int = 88) -> str:
+    """
+    Wraps prose text using markdown HARD line breaks (two trailing spaces + \\n).
+
+    Why not single \\n: CommonMark (Chainlit/React-Markdown) treats a single newline
+    as a space — it is invisible in the rendered output. Only "  \\n" (two trailing
+    spaces + newline) produces a true <br> line break without a paragraph gap.
+    """
+    segments: list[str] = []
+
+    for paragraph in text.splitlines():
+        if not paragraph.strip():
+            segments.append("")      # blank line = paragraph separator
+            continue
+
+        words, line_buf, line_len = paragraph.split(), [], 0
+        for word in words:
+            needed = len(word) + (1 if line_buf else 0)
+            if line_len + needed > max_len and line_buf:
+                segments.append(" ".join(line_buf) + "  ")   # two trailing spaces = <br>
+                line_buf, line_len = [word], len(word)
+            else:
+                line_buf.append(word)
+                line_len += needed
+        if line_buf:
+            segments.append(" ".join(line_buf))
+
+    return "\n".join(segments)
+
+
+def _format_source_link(src: str) -> str:
+    """
+    Converts raw URLs in source references to Markdown link syntax.
+
+    Raw URLs are the #1 cause of horizontal scrollbars in Chainlit — they are
+    single tokens with no whitespace so the browser cannot wrap them.
+    [display text](url) keeps the URL in the href and renders short display text.
+
+    Handles:
+      "https://url.com — description"  →  [description](https://url.com)
+      "https://url.com"                →  [url.com](https://url.com)
+      "plain text"                     →  plain text (unchanged)
+    """
+    src = str(src).strip()
+    if " — " in src and src.split(" — ", 1)[0].startswith("http"):
+        url, desc = src.split(" — ", 1)
+        url, desc = url.strip(), desc.strip()
+        if len(desc) > 72:
+            desc = desc[:69] + "..."
+        return f"[{desc}]({url})"
+    if src.startswith("http"):
+        try:
+            domain = src.split("//", 1)[1].split("/")[0]
+            return f"[{domain}]({src})"
+        except IndexError:
+            return src
+    return src
+
+
+# ── Plan Section Constants ────────────────────────────────────────────────────
+
+PLAN_SECTIONS = [
+    ("🏢 Company Overview",     "company_overview"),
+    ("💰 Financial Snapshot",   "financial_snapshot"),
+    ("📈 Market Size (TAM)",    "market_revenue"),
+    ("⚔️  Top Competitors",      "competitors"),
+    ("👥 Key Executives",       "key_executives"),
+    ("🎯 Strategic Priorities", "strategic_priorities"),
+    ("⚠️  Pain Points",          "pain_points"),
+    ("💡 Value Proposition",    "value_proposition"),
+    ("🚀 Action Plan",          "action_plan"),
+]
+
+
+def _render_section_block(title: str, key: str, plan_data: dict) -> str:
+    """
+    Renders a single plan section with confidence badge and wrapped content.
+    Returns empty string if the section has no content.
+
+    BUG FIX (wrapping): wrap_text() produces multi-line strings separated by \\n.
+    When a wrapped string is embedded inside a Markdown list item (``* text``),
+    continuation lines must be indented by 2 spaces, otherwise CommonMark/React-Markdown
+    treats them as new paragraphs and the list structure collapses.
+
+    Before fix:
+        * First line that is very long and needs  ← hard break
+        wrapping here                              ← NOT indented → breaks list
+    After fix:
+        * First line that is very long and needs  ← hard break
+          wrapping here                            ← 2-space indent → stays in list
+    """
+    value          = plan_data.get(key)
+    confidence_map = plan_data.get("data_confidence", {})
+
+    if not value or value in ("Unknown", []):
+        return ""
+
+    badge     = _confidence_badge(confidence_map.get(key, ""))
+    badge_str = f"  {badge}" if badge else ""
+    # Use \n\n after the header so the content is a fresh block — avoids the
+    # header and first line merging into one paragraph in some renderers.
+    block     = f"#### {title}{badge_str}\n\n"
+
+    if isinstance(value, list):
+        for item in value:
+            clean   = str(item).replace("<br>", "").replace("•", "").strip()
+            wrapped = wrap_text(clean)
+            lines   = wrapped.split("\n")
+            if len(lines) > 1:
+                # First line gets the bullet; continuation lines get 2-space indent
+                block += f"* {lines[0]}\n"
+                for cont in lines[1:]:
+                    block += f"  {cont}\n"
+            else:
+                block += f"* {wrapped}\n"
+    else:
+        clean = str(value).replace("<br>", " ").strip()
+        block += f"{wrap_text(clean)}\n"
+
+    return block + "\n"
+
+
 # ── Plan Formatting ───────────────────────────────────────────────────────────
 
 def format_plan_to_markdown(plan_data: dict) -> str:
     """
     Converts an Account Plan dict into a structured Markdown document.
-    Includes per-section confidence badges and data quality warnings.
+    Used by PDF/Markdown export. UI rendering uses _stream_plan_progressively.
+    All prose values are wrapped with hard line breaks to prevent overflow.
+    Source references rendered as [text](url) links to prevent URL overflow.
     """
-    company        = plan_data.get("company_name", "Unknown")
-    goal           = plan_data.get("user_goal",    "General Research")
-    confidence_map = plan_data.get("data_confidence", {})
-    warnings       = plan_data.get("data_warnings",   [])
+    company  = plan_data.get("company_name", "Unknown")
+    goal     = plan_data.get("user_goal",    "General Research")
+    warnings = plan_data.get("data_warnings", [])
 
     md  = f"### 📊 ACCOUNT PLAN: **{company.upper()}**\n"
     md += f"**🎯 Sales Goal:** {goal}\n\n"
 
     if warnings:
         for w in warnings:
-            md += f"> ⚠️ **Data Notice:** {w}\n"
+            md += f"> ⚠️ **Data Notice:** {wrap_text(str(w))}\n"
         md += "\n"
 
     md += "---\n\n"
 
-    sections = [
-        ("🏢 Company Overview",      "company_overview"),
-        ("💰 Financial Snapshot",    "financial_snapshot"),
-        ("📈 Market Size (TAM)",     "market_revenue"),
-        ("⚔️  Top Competitors",       "competitors"),
-        ("👥 Key Executives",        "key_executives"),
-        ("🎯 Strategic Priorities",  "strategic_priorities"),
-        ("⚠️  Pain Points",           "pain_points"),
-        ("💡 Value Proposition",     "value_proposition"),
-        ("🚀 Action Plan",           "action_plan"),
-    ]
+    for title, key in PLAN_SECTIONS:
+        md += _render_section_block(title, key, plan_data)
 
-    for title, key in sections:
-        value = plan_data.get(key)
-        if not value or value in ("Unknown", []):
-            continue
-
-        badge = _confidence_badge(confidence_map.get(key, ""))
-        badge_str = f"  {badge}" if badge else ""
-
-        md += f"#### {title}{badge_str}\n"
-
-        if isinstance(value, list):
-            for item in value:
-                clean = str(item).replace("<br>", "").replace("•", "").strip()
-                md += f"* {clean}\n"
-        else:
-            clean = str(value).replace("<br>", "\n").strip()
-            md += f"{clean}\n"
-
-        md += "\n"
-
-    # ── Source Attribution Footer ─────────────────────────────────────────────
-    # Surfaces the URLs used by the LLM so users can verify key claims.
-    # A professional B2B research tool must be verifiable — this is a trust signal.
     sources = plan_data.get("source_references", [])
     if sources:
         md += "---\n\n#### 📎 Sources\n"
         for src in sources:
-            clean_src = str(src).strip()
-            if clean_src:
-                md += f"* {clean_src}\n"
+            formatted = _format_source_link(src)
+            if formatted:
+                md += f"* {formatted}\n"
         md += "\n"
 
     return md
+
+
+async def _stream_plan_progressively(plan_data: dict) -> None:
+    """
+    Sends the Account Plan to the Chainlit UI one section at a time.
+
+    WHY: Sending the full plan as a single large message has two problems:
+      1. The user sees nothing until the entire string is assembled (~0 perceived
+         responsiveness for a 1–2KB payload rendered in one shot).
+      2. A single large Markdown message is harder for Chainlit's React-Markdown
+         renderer to update incrementally — it re-renders the whole block on each
+         stream_token call, causing visible jank.
+
+    HOW: Each section is an independent `cl.Message`. Chainlit renders each
+    message immediately as it arrives. The user sees the header, then each section
+    appearing one by one, giving genuine progressive disclosure.
+
+    Uses _render_section_block (wrapping + confidence badges) and
+    _format_source_link (URL → [text](url) to prevent horizontal overflow).
+    """
+    company  = plan_data.get("company_name", "Unknown")
+    goal     = plan_data.get("user_goal",    "General Research")
+    warnings = plan_data.get("data_warnings", [])
+
+    # ── Header block (company, goal, warnings) ────────────────────────────────
+    header = f"### 📊 ACCOUNT PLAN: **{company.upper()}**\n"
+    header += f"**🎯 Sales Goal:** {goal}\n\n"
+    if warnings:
+        for w in warnings:
+            header += f"> ⚠️ **Data Notice:** {wrap_text(str(w))}\n"
+        header += "\n"
+    header += "---"
+    await cl.Message(content=header).send()
+
+    # ── Sections — one message per section for progressive rendering ──────────
+    for title, key in PLAN_SECTIONS:
+        block = _render_section_block(title, key, plan_data)
+        if block:
+            await cl.Message(content=block).send()
+
+    # ── Source attribution footer ─────────────────────────────────────────────
+    # Rendered last so it doesn't interrupt the content flow.
+    # _format_source_link converts bare URLs to [domain](url) to prevent
+    # horizontal scrollbars from long unbreakable URL tokens.
+    sources = plan_data.get("source_references", [])
+    if sources:
+        sources_md = "---\n\n#### 📎 Sources\n"
+        for src in sources:
+            formatted = _format_source_link(src)
+            if formatted:
+                sources_md += f"* {formatted}\n"
+        await cl.Message(content=sources_md).send()
 
 def sanitize_for_pdf(text: str) -> str:
     replacements = {
@@ -384,41 +529,70 @@ async def main(message: cl.Message) -> None:
     """
     Per-message handler. Retrieves the per-session agent from cl.user_session
     so each user's state is isolated.
+
+    Progress step architecture (Bug 2 fix):
+    ─────────────────────────────────────────────────────────────────────────
+    WRONG (original): _on_progress was defined INSIDE the `async with cl.Step`
+    context. Chainlit nests any step created inside another step's async-with
+    block as a *child* of that parent step. All research steps (🔍 Researching,
+    📰 Scanning, etc.) therefore appeared as children of "🤔 Processing…" and
+    rendered all-at-once when the parent collapsed — no progressive display.
+
+    CORRECT (this version):
+      1. A brief "🤔 Classifying…" step opens and closes IMMEDIATELY — it covers
+         only the ~1s intent-classification call at the top of process_user_input.
+      2. _on_progress is registered BEFORE the pipeline is called and OUTSIDE any
+         step context, so every cl.Step it creates is a TOP-LEVEL step.
+      3. The pipeline's _emit_progress() calls fire during execution, not after,
+         so the user sees 🔍 → 📰 → 🧠 → ✅ in real-time as each stage begins.
+    ─────────────────────────────────────────────────────────────────────────
     """
-    agent     = _get_session_agent()
+    agent      = _get_session_agent()
     user_input = message.content.strip()
     if not user_input:
         return
 
-    # ── Export shortcut (intercept before routing) ────────────────────────────
+    # ── Export shortcut ───────────────────────────────────────────────────────
     export_keywords = {"download", "export", "save", "pdf", "markdown"}
     if any(kw in user_input.lower() for kw in export_keywords):
         await _handle_export(agent, user_input)
         return
 
-    # ── Main pipeline ─────────────────────────────────────────────────────────
-    result: Optional[dict] = None
+    # ── Step 1: Show a brief "Classifying…" step, then CLOSE it ──────────────
+    # This step covers only the intent-classification LLM call (~1s).
+    # It MUST close before the research pipeline starts so that pipeline steps
+    # appear at the top level — not nested as children of this step.
+    async with cl.Step(name="🤔 Classifying intent...") as classify_step:
+        classify_step.output = "Understanding your request…"
+        # Yield briefly so Chainlit renders the step before pipeline starts
+        await asyncio.sleep(0)
+    # ← thinking_step context exits here; subsequent steps are top-level
 
-    async with cl.Step(name="🤔 Processing...") as thinking_step:
-        thinking_step.output = "Classifying intent..."
-        try:
-            result = await agent.process_user_input(user_input)
-            thinking_step.output = "Complete."
-        except Exception as exc:
-            logger.error("process_user_input error: %s\n%s", exc, traceback.format_exc())
-            await cl.Message(
-                content=f"⚠️ Unexpected error: {exc}\n\nPlease try again."
-            ).send()
-            return
+    # ── Step 2: Register real-time progress callback (top-level scope) ────────
+    # _on_progress is now defined OUTSIDE any active step context.
+    # Each cl.Step it creates will be a top-level step in the Chainlit thread.
+    async def _on_progress(label: str) -> None:
+        """Opens (and immediately closes) a top-level step for each pipeline stage."""
+        async with cl.Step(name=label) as step:
+            step.output = label
+            await asyncio.sleep(0)   # yield so Chainlit renders before next stage
+
+    agent.set_progress_callback(_on_progress)
+
+    # ── Step 3: Run the pipeline ───────────────────────────────────────────────
+    result: Optional[dict] = None
+    try:
+        result = await agent.process_user_input(user_input)
+    except Exception as exc:
+        logger.error("process_user_input error: %s\n%s", exc, traceback.format_exc())
+        await cl.Message(
+            content=f"⚠️ Unexpected error: {exc}\n\nPlease try again."
+        ).send()
+        return
 
     if result is None:
         await cl.Message(content="⚠️ No response generated. Please try again.").send()
         return
-
-    # ── Show research progress steps ──────────────────────────────────────────
-    for label in result.get("progress_messages", []):
-        async with cl.Step(name=label):
-            pass
 
     await _dispatch_result(agent, result, user_input)
 
@@ -427,6 +601,9 @@ async def _dispatch_result(agent: ResearchAgent, result: dict, user_input: str =
     """
     Routes a result dict to the appropriate Chainlit output method.
     user_input is passed through so DOWNLOAD_PLAN can distinguish pdf vs markdown.
+
+    Plan rendering uses _stream_plan_progressively (section-by-section) rather than
+    a single format_plan_to_markdown() blob — see that function for the rationale.
     """
     response_type = result.get("response_type", "message")
 
@@ -448,31 +625,31 @@ async def _dispatch_result(agent: ResearchAgent, result: dict, user_input: str =
         # Confirmation message (e.g. "✅ Refreshed pain_points for Netflix")
         if result.get("content"):
             await cl.Message(content=result["content"]).send()
-        # Re-render plan only when it actually changed — prevents redundant scroll
+
+        # Progressive section-by-section render — replaces single large message.
+        # Only fires when the plan actually changed; prevents redundant re-renders.
         if _should_render_plan(result):
-            plan_md = format_plan_to_markdown(agent.state.get_current_plan())
-            await cl.Message(content=plan_md).send()
-        # Render proactive suggestions below main content (clean bullet list)
+            await _stream_plan_progressively(agent.state.get_current_plan())
+
+        # Proactive suggestions rendered as a separate message below the plan
         suggestions = result.get("suggestions", [])
         if suggestions:
-            suggestion_md = "\n\n---\n**💡 Proactive suggestions:**\n"
+            suggestion_md = "---\n**💡 Suggested next steps:**\n"
             suggestion_md += "\n".join(f"- {s}" for s in suggestions)
             await cl.Message(content=suggestion_md).send()
-        # If plan_changed is False, the confirmation message above is sufficient.
-        # We deliberately do NOT show an "unchanged" system message to the user.
 
     elif response_type == "download":
-        # Preserve user intent: route to PDF or Markdown based on original message
         await _handle_export(agent, user_input or "markdown")
 
     else:
-        # Generic message — show content, then plan if it changed
+        # Generic message (confused, general question, error, etc.)
         content = result.get("content", "")
         if content:
             await cl.Message(content=content).send()
+        # If a message response carries a plan change (e.g. conflict resolution),
+        # stream the updated plan progressively.
         if result.get("plan_changed", False):
-            plan_md = format_plan_to_markdown(agent.state.get_current_plan())
-            await cl.Message(content=plan_md).send()
+            await _stream_plan_progressively(agent.state.get_current_plan())
 
 
 async def _handle_export(agent: ResearchAgent, user_input: str) -> None:

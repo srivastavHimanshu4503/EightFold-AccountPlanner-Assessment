@@ -22,7 +22,7 @@ A conversational AI agent that autonomously researches companies, synthesises fi
 
 ## 🌐 Live Demo
 
-Try the deployed version: [Launch the Agent on Hugging Face](https://huggingface.co/spaces/codeAIDrafter/Eightfold-Research-Agent)
+Try the deployed version: [Launch the Agent on Hugging Face](https://huggingface.co/spaces/codeAIDrafter/account-plan-agent)
 
 > ⚠️ Note: Performance may vary due to API rate limits.
 

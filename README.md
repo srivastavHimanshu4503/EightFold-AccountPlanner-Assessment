@@ -155,7 +155,7 @@ SERP_API_KEY=        # Optional — higher-quality search; falls back to DuckDuc
 
 ## 📸 Demo
 
-### 🎬 End-to-End Flow
+### 🎬 Landing Page
 ![Demo GIF](images/demo_homePage.png)
 
 ### 📊 Sample Account Plan Output

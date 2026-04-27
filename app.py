@@ -2,16 +2,16 @@
 app.py — Chainlit UI for the Enterprise Research Agent
 =======================================================
 KEY FIXES FROM AUDIT:
-  - Per-session ResearchAgent via cl.user_session (no global singleton).
-  - Startup environment validation (fast-fail before any user message).
-  - Streaming responses for direct follow-up answers.
-  - Plan hash check to suppress redundant re-renders.
-  - Confidence badges (🟢 HIGH / 🟡 MEDIUM / 🔴 LOW) per section.
-  - Data quality warnings for private/low-data companies.
-  - PDF export (fpdf2) with Markdown fallback.
-  - SECTION_UPDATE, COMPARE, and DOWNLOAD intents wired through.
-  - Progress step labels during research.
-  - Audio handler uses per-session agent (not global).
+    - Per-session ResearchAgent via cl.user_session (no global singleton).
+    - Startup environment validation (fast-fail before any user message).
+    - Streaming responses for direct follow-up answers.
+    - Plan hash check to suppress redundant re-renders.
+    - Confidence badges (🟢 HIGH / 🟡 MEDIUM / 🔴 LOW) per section.
+    - Data quality warnings for private/low-data companies.
+    - PDF export (fpdf2) with Markdown fallback.
+    - SECTION_UPDATE, COMPARE, and DOWNLOAD intents wired through.
+    - Progress step labels during research.
+    - Audio handler uses per-session agent (not global).
 """
 from __future__ import annotations
 
@@ -49,6 +49,22 @@ CONFIDENCE_LEVELS = {
     "LOW":    ("🔴", "LOW — estimated"),
 }
 
+def extract_parentheses_content(text: str) -> str:
+    start = text.find("(")
+    if start == -1:
+        return ""
+
+    stack = 0
+    for i in range(start, len(text)):
+        if text[i] == "(":
+            stack += 1
+        elif text[i] == ")":
+            stack -= 1
+            if stack == 0:
+                return text[start + 1:i].strip()
+
+    return ""  # no properly closed parentheses
+
 
 def _confidence_badge(confidence_value: str) -> str:
     """
@@ -61,17 +77,19 @@ def _confidence_badge(confidence_value: str) -> str:
     """
     if not confidence_value:
         return ""
+
     val = confidence_value.strip()
+
     for level, (emoji, label) in CONFIDENCE_LEVELS.items():
         if val.upper().startswith(level):
-            # Extract optional explanation inside parentheses
-            explanation = ""
-            if "(" in val:
-                explanation = val[val.index("(") + 1:].rstrip(")")
+
+            explanation = extract_parentheses_content(val)
+
             if explanation:
                 return f"{emoji} *{label} — {explanation}*"
             return f"{emoji} *{label}*"
-    return f"*{val}*"  # fallback: show raw value italicised
+
+    return f"*{val}*"
 
 
 # ── Plan Formatting ───────────────────────────────────────────────────────────
@@ -142,46 +160,98 @@ def format_plan_to_markdown(plan_data: dict) -> str:
 
     return md
 
+def sanitize_for_pdf(text: str) -> str:
+    replacements = {
+        "—": "-",
+        "–": "-",
+        "•": "-",
+        "🟢": "",
+        "🟡": "",
+        "🔴": "",
+        "🚀": "",
+        "💡": "",
+        "📊": "",
+        "📈": "",
+        "📎": "",
+    }
+    for k, v in replacements.items():
+        text = text.replace(k, v)
+    return text
+
 
 def export_plan_to_pdf(plan_data: dict) -> Optional[bytes]:
-    """
-    Generates a branded PDF of the Account Plan using fpdf2.
-    Returns None and logs a warning if fpdf2 is not installed,
-    so the caller can gracefully fall back to Markdown export.
-    """
     try:
-        from fpdf import FPDF  # type: ignore
-
-        company        = plan_data.get("company_name", "Unknown").upper()
-        goal           = plan_data.get("user_goal",    "General Research")
-        confidence_map = plan_data.get("data_confidence", {})
-        warnings       = plan_data.get("data_warnings",   [])
+        from fpdf import FPDF
 
         pdf = FPDF()
-        pdf.set_margins(left=15, top=15, right=15)
+        pdf.set_margins(15, 15, 15)
         pdf.add_page()
 
-        # ── Header ────────────────────────────────────────────────────────────
+        # ── Font Setup (Hybrid Unicode + Fallback) ───────────────────────────
+        use_unicode_font = False
+        font_path = os.path.join(os.getcwd(), "DejaVuSans.ttf")
+
+        if os.path.exists(font_path):
+            try:
+                pdf.add_font("DejaVu", "", font_path, uni=True)
+                pdf.add_font("DejaVu", "B", font_path, uni=True)
+                use_unicode_font = True
+            except Exception:
+                use_unicode_font = False
+
+        def set_font(style="", size=10):
+            font_name = "DejaVu" if use_unicode_font else "Helvetica"
+            pdf.set_font(font_name, style, size)
+
+        def wrap_long_words(text: str, max_len=60):
+            words = text.split()
+            out = []
+            for w in words:
+                if len(w) > max_len:
+                    out.append(w[:max_len] + "-")
+                    out.append(w[max_len:])
+                else:
+                    out.append(w)
+            return " ".join(out)
+
+        def clean_text(text: str) -> str:
+            text = str(text).replace("<br>", "\n").strip()
+            text = wrap_long_words(text)
+            return text if use_unicode_font else sanitize_for_pdf(text)
+
+        def safe_multi_cell(text: str, line_height=7):
+            pdf.set_x(pdf.l_margin)
+            usable_width = pdf.w - pdf.l_margin - pdf.r_margin
+            pdf.multi_cell(usable_width, line_height, text)
+
+        company        = plan_data.get("company_name", "Unknown").upper()
+        goal           = plan_data.get("user_goal", "General Research")
+        confidence_map = plan_data.get("data_confidence", {})
+        warnings       = plan_data.get("data_warnings", [])
+
+        # ── Header ───────────────────────────────────────────────────────────
         pdf.set_fill_color(20, 20, 80)
         pdf.set_text_color(255, 255, 255)
-        pdf.set_font("Helvetica", "B", 18)
-        pdf.cell(0, 14, f"ACCOUNT PLAN: {company}", fill=True, ln=True, align="C")
+        set_font("B", 18)
+        pdf.cell(0, 14, clean_text(f"ACCOUNT PLAN: {company}"), fill=True, new_x="LMARGIN", new_y="NEXT", align="C")
+
         pdf.ln(2)
 
         pdf.set_text_color(50, 50, 50)
-        pdf.set_font("Helvetica", "", 11)
-        pdf.cell(0, 8, f"Sales Goal: {goal}", ln=True, align="C")
+        set_font("", 11)
+        pdf.cell(0, 8, clean_text(f"Sales Goal: {goal}"), new_x="LMARGIN", new_y="NEXT", align="C")
+
         pdf.ln(5)
 
-        # ── Data Warnings ─────────────────────────────────────────────────────
+        # ── Warnings ─────────────────────────────────────────────────────────
         if warnings:
-            pdf.set_font("Helvetica", "I", 9)
+            set_font("I", 9)
             pdf.set_text_color(160, 80, 0)
             for w in warnings:
-                pdf.multi_cell(0, 6, f"[!] {w}")
+                safe_multi_cell(clean_text(f"[!] {w}"), 6)
             pdf.ln(3)
 
-        # ── Sections ──────────────────────────────────────────────────────────
+        # ── Sections ─────────────────────────────────────────────────────────
         CONF_COLORS = {
             "HIGH":   (0, 140, 0),
             "MEDIUM": (180, 120, 0),
@@ -189,15 +259,15 @@ def export_plan_to_pdf(plan_data: dict) -> Optional[bytes]:
         }
 
         sections = [
-            ("Company Overview",      "company_overview"),
-            ("Financial Snapshot",    "financial_snapshot"),
-            ("Market Size (TAM)",     "market_revenue"),
-            ("Top Competitors",       "competitors"),
-            ("Key Executives",        "key_executives"),
-            ("Strategic Priorities",  "strategic_priorities"),
-            ("Pain Points",           "pain_points"),
-            ("Value Proposition",     "value_proposition"),
-            ("Action Plan",           "action_plan"),
+            ("Company Overview", "company_overview"),
+            ("Financial Snapshot", "financial_snapshot"),
+            ("Market Size (TAM)", "market_revenue"),
+            ("Top Competitors", "competitors"),
+            ("Key Executives", "key_executives"),
+            ("Strategic Priorities", "strategic_priorities"),
+            ("Pain Points", "pain_points"),
+            ("Value Proposition", "value_proposition"),
+            ("Action Plan", "action_plan"),
         ]
 
         for title, key in sections:
@@ -205,18 +275,16 @@ def export_plan_to_pdf(plan_data: dict) -> Optional[bytes]:
             if not value or value in ("Unknown", []):
                 continue
 
-            conf  = confidence_map.get(key, "")
-            # Strip enriched explanation for compact PDF header label
+            conf = confidence_map.get(key, "")
             conf_short = conf.split("(")[0].strip() if conf else ""
             conf_label = f" [{conf_short}]" if conf_short else ""
 
-            # Section header bar
+            # Section header
             pdf.set_fill_color(235, 235, 255)
             pdf.set_text_color(20, 20, 80)
-            pdf.set_font("Helvetica", "B", 12)
-            pdf.cell(0, 9, f"{title}{conf_label}", fill=True, ln=True)
+            set_font("B", 12)
+            pdf.cell(0, 9, clean_text(f"{title}{conf_label}"), fill=True, new_x="LMARGIN", new_y="NEXT")
 
-            # Confidence underline
             if conf_short in CONF_COLORS:
                 r, g, b = CONF_COLORS[conf_short]
                 pdf.set_draw_color(r, g, b)
@@ -226,49 +294,43 @@ def export_plan_to_pdf(plan_data: dict) -> Optional[bytes]:
             pdf.ln(2)
 
             # Content
-            pdf.set_font("Helvetica", "", 10)
+            set_font("", 10)
             pdf.set_text_color(40, 40, 40)
 
             if isinstance(value, list):
                 for item in value:
-                    clean = str(item).replace("<br>", "").replace("•", "").strip()
-                    pdf.multi_cell(0, 7, f"  - {clean}")
+                    safe_multi_cell(f"  - {clean_text(item)}", 7)
             else:
-                clean = str(value).replace("<br>", "\n").strip()
-                pdf.multi_cell(0, 7, clean)
+                safe_multi_cell(clean_text(value), 7)
 
             pdf.ln(5)
 
-        # ── Source Attribution Section ─────────────────────────────────────────
-        # Allows the recipient of the PDF to independently verify key claims —
-        # critical for a document that may go to a sales director or executive.
+        # ── Sources ──────────────────────────────────────────────────────────
         sources = plan_data.get("source_references", [])
         if sources:
             pdf.set_fill_color(245, 245, 245)
             pdf.set_text_color(80, 80, 80)
-            pdf.set_font("Helvetica", "B", 11)
-            pdf.cell(0, 9, "Sources & References", fill=True, ln=True)
+            set_font("B", 11)
+            pdf.cell(0, 9, "Sources & References", fill=True, new_x="LMARGIN", new_y="NEXT")
+
             pdf.ln(2)
-            pdf.set_font("Helvetica", "", 9)
+
+            set_font("", 9)
             for src in sources:
-                clean = str(src).strip()
-                if clean:
-                    pdf.multi_cell(0, 6, f"  - {clean}")
+                safe_multi_cell(f"  - {clean_text(src)}", 6)
+
             pdf.ln(3)
 
         return bytes(pdf.output())
 
     except ImportError:
-        logger.warning(
-            "fpdf2 not installed — PDF export unavailable. "
-            "Install with: pip install fpdf2"
-        )
+        logger.warning("fpdf2 not installed. Install with: pip install fpdf2")
         return None
     except Exception as exc:
-        logger.error("PDF export error: %s", exc)
-        return None
-
-
+        logger.error("PDF export error: %s", exc, exc_info=True)
+        raise RuntimeError(f"PDF generation failed: {exc}") from exc
+    
+    
 def _should_render_plan(result: dict) -> bool:
     """
     Returns True only when a full plan re-render is warranted.
@@ -390,6 +452,12 @@ async def _dispatch_result(agent: ResearchAgent, result: dict, user_input: str =
         if _should_render_plan(result):
             plan_md = format_plan_to_markdown(agent.state.get_current_plan())
             await cl.Message(content=plan_md).send()
+        # Render proactive suggestions below main content (clean bullet list)
+        suggestions = result.get("suggestions", [])
+        if suggestions:
+            suggestion_md = "\n\n---\n**💡 Proactive suggestions:**\n"
+            suggestion_md += "\n".join(f"- {s}" for s in suggestions)
+            await cl.Message(content=suggestion_md).send()
         # If plan_changed is False, the confirmation message above is sufficient.
         # We deliberately do NOT show an "unchanged" system message to the user.
 
@@ -427,8 +495,13 @@ async def _handle_export(agent: ResearchAgent, user_input: str) -> None:
     want_pdf = "pdf" in user_input.lower()
 
     if want_pdf:
+        pdf_bytes = None
+        pdf_error = None
         async with cl.Step(name="📄 Generating PDF..."):
-            pdf_bytes = await _run_in_thread(export_plan_to_pdf, plan)
+            try:
+                pdf_bytes = await _run_in_thread(export_plan_to_pdf, plan)
+            except RuntimeError as exc:
+                pdf_error = str(exc)
 
         if pdf_bytes:
             await cl.Message(
@@ -444,9 +517,15 @@ async def _handle_export(agent: ResearchAgent, user_input: str) -> None:
             ).send()
             return
         else:
-            await cl.Message(
-                content="⚠️ PDF generation failed (fpdf2 not installed). Exporting as Markdown instead..."
-            ).send()
+            # Show the real error reason, not the generic "fpdf2 not installed" message
+            if pdf_error:
+                await cl.Message(
+                    content=f"⚠️ {pdf_error}\n\nExporting as Markdown instead..."
+                ).send()
+            else:
+                await cl.Message(
+                    content="⚠️ fpdf2 is not installed. Run `pip install fpdf2` then restart.\n\nExporting as Markdown instead..."
+                ).send()
             # Fall through to Markdown
 
     # Markdown export
